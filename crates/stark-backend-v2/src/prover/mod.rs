@@ -76,6 +76,7 @@ where
         unsorted_ctx: ProvingContextV2<PB>,
     ) -> Self::Proof {
         assert_eq!(self.device.config(), &mpk.params);
+        info!("PROVE_START: CoordinatorV2::prove called");
         let transcript = &mut self.transcript;
         transcript.observe_commit(mpk.vk_pre_hash);
 
@@ -83,6 +84,11 @@ where
         // `ctx` should NOT be permuted anymore: the ordering by `trace_idx` is now fixed.
 
         let num_airs_present = ctx.per_trace.len();
+        info!(
+            "PROVE_CONTEXT: Processing {} AIRs with {} total AIR keys",
+            ctx.per_trace.len(),
+            mpk.per_air.len()
+        );
         info!(num_airs_present);
 
         let _main_commit_span = info_span!("prover.main_trace_commit", phase = "prover").entered();
@@ -155,6 +161,7 @@ where
         let (gkr_proof, batch_constraint_proof) = constraints_proof.into();
         let (stacking_proof, whir_proof) = opening_proof.into();
 
+        info!("PROVE_END: CoordinatorV2::prove completed successfully");
         Proof {
             public_values,
             trace_vdata,
