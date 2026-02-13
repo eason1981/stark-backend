@@ -117,6 +117,8 @@ pub fn stacked_commit(
     k_whir: usize,
     traces: &[&ColMajorMatrix<F>],
 ) -> (Digest, StackedPcsData<F, Digest>) {
+    tracing::info!("stacked_commit: l_skip = {l_skip}, n_stack = {n_stack}, log_blowup = {log_blowup}, k_whir = {k_whir}");
+
     let (q_trace, layout) = stacked_matrix(l_skip, n_stack, traces);
     let rs_matrix = rs_code_matrix(l_skip, log_blowup, &q_trace);
     let tree = MerkleTree::new(rs_matrix, 1 << k_whir);
