@@ -62,6 +62,28 @@ pub fn app_params_with_100_bits_security(log_stacked_height: usize) -> SystemPar
     )
 }
 
+/// Default `log_blowup` for the pico compress layer (higher than app to reduce WHIR query count).
+pub const DEFAULT_COMPRESS_LOG_BLOWUP: usize = 2;
+
+/// Returns `SystemParams` for the pico compress layer targeting 100 bits of proven RBR security.
+///
+/// Uses `log_blowup=2` (vs `app_params` which uses 1) to reduce WHIR query count while
+/// maintaining the same security level. Re-proves a single combine proof into a smaller proof.
+pub fn compress_params_with_100_bits_security(log_stacked_height: usize) -> SystemParams {
+    SystemParams::new(
+        DEFAULT_COMPRESS_LOG_BLOWUP,
+        DEFAULT_APP_L_SKIP,
+        log_stacked_height.saturating_sub(DEFAULT_APP_L_SKIP),
+        2048,
+        WHIR_MAX_LOG_FINAL_POLY_LEN,
+        5,  // folding pow
+        15, // mu pow
+        WhirProximityStrategy::UniqueDecoding,
+        SECURITY_BITS_TARGET,
+        log_up_security_params_baby_bear_100_bits(),
+    )
+}
+
 /// Returns `SystemParams` targeting 100 bits of proven RBR security for leaf aggregation circuits.
 ///
 /// # Assumptions for 100-bit security
