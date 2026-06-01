@@ -1,6 +1,8 @@
 use openvm_stark_backend::{SystemParams, WhirProximityStrategy};
 
-use crate::config::log_up_params::log_up_security_params_baby_bear_100_bits;
+use crate::config::log_up_params::{
+    log_up_security_params_baby_bear_100_bits, log_up_security_params_koala_bear_100_bits,
+};
 
 /// STARK config where the base field is BabyBear, extension field is BabyBear^4, and the hasher is
 /// `Poseidon2<Bn254>`.
@@ -12,6 +14,9 @@ pub mod baby_bear_poseidon2;
 /// BN254 Poseidon2 permutations used by the BabyBear + BN254 configuration.
 #[cfg(feature = "baby-bear-bn254-poseidon2")]
 pub mod bn254_poseidon2;
+/// STARK config where the base field is KoalaBear, extension field is KoalaBear^4, and the hasher
+/// is `Poseidon2<KoalaBear>`.
+pub mod koala_bear_poseidon2;
 pub mod log_up_params;
 
 // ==========================================================================
@@ -170,5 +175,88 @@ pub fn root_params_with_100_bits_security() -> SystemParams {
         WhirProximityStrategy::ListDecoding { m: 2 },
         SECURITY_BITS_TARGET,
         log_up_security_params_baby_bear_100_bits(),
+    )
+}
+
+// ==========================================================================
+// KoalaBear production configurations (100-bit RBR security)
+// ==========================================================================
+
+pub fn kb_app_params_with_100_bits_security(log_stacked_height: usize) -> SystemParams {
+    assert!(
+        log_stacked_height <= MAX_APP_LOG_STACKED_HEIGHT,
+        "log_stacked_height must be <= {MAX_APP_LOG_STACKED_HEIGHT}",
+    );
+    SystemParams::new(
+        DEFAULT_APP_LOG_BLOWUP,
+        DEFAULT_APP_L_SKIP,
+        log_stacked_height.saturating_sub(DEFAULT_APP_L_SKIP),
+        2048,
+        WHIR_MAX_LOG_FINAL_POLY_LEN,
+        5,
+        15,
+        WhirProximityStrategy::UniqueDecoding,
+        SECURITY_BITS_TARGET,
+        log_up_security_params_koala_bear_100_bits(),
+    )
+}
+
+pub fn kb_compress_params_with_100_bits_security(log_stacked_height: usize) -> SystemParams {
+    SystemParams::new(
+        DEFAULT_COMPRESS_LOG_BLOWUP,
+        DEFAULT_APP_L_SKIP,
+        log_stacked_height.saturating_sub(DEFAULT_APP_L_SKIP),
+        2048,
+        WHIR_MAX_LOG_FINAL_POLY_LEN,
+        5,
+        15,
+        WhirProximityStrategy::UniqueDecoding,
+        SECURITY_BITS_TARGET,
+        log_up_security_params_koala_bear_100_bits(),
+    )
+}
+
+pub fn kb_leaf_params_with_100_bits_security() -> SystemParams {
+    SystemParams::new(
+        DEFAULT_LEAF_LOG_BLOWUP,
+        4,
+        17,
+        2048,
+        WHIR_MAX_LOG_FINAL_POLY_LEN,
+        4,
+        13,
+        WhirProximityStrategy::UniqueDecoding,
+        SECURITY_BITS_TARGET,
+        log_up_security_params_koala_bear_100_bits(),
+    )
+}
+
+pub fn kb_internal_params_with_100_bits_security() -> SystemParams {
+    SystemParams::new(
+        DEFAULT_INTERNAL_LOG_BLOWUP,
+        2,
+        17,
+        512,
+        WHIR_MAX_LOG_FINAL_POLY_LEN,
+        18,
+        20,
+        WhirProximityStrategy::ListDecoding { m: 2 },
+        SECURITY_BITS_TARGET,
+        log_up_security_params_koala_bear_100_bits(),
+    )
+}
+
+pub fn kb_root_params_with_100_bits_security() -> SystemParams {
+    SystemParams::new(
+        DEFAULT_ROOT_LOG_BLOWUP,
+        2,
+        19,
+        9,
+        WHIR_MAX_LOG_FINAL_POLY_LEN,
+        20,
+        20,
+        WhirProximityStrategy::ListDecoding { m: 2 },
+        SECURITY_BITS_TARGET,
+        log_up_security_params_koala_bear_100_bits(),
     )
 }

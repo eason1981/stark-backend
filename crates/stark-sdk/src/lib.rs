@@ -2,6 +2,7 @@
 pub use openvm_cpu_backend;
 pub use openvm_stark_backend;
 pub use p3_baby_bear;
+pub use p3_koala_bear;
 
 pub mod bench;
 pub mod config;
