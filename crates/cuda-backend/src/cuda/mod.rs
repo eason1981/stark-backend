@@ -13,12 +13,33 @@ pub mod device_info;
 pub mod logup_zerocheck;
 pub mod matrix;
 pub mod merkle_tree;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod merkle_tree_kb;
 pub mod mle_interpolate;
 pub mod ntt;
 pub mod poly;
 pub mod sponge;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod sponge_kb;
 pub mod stacked_reduction;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod ntt_kb;
 pub mod whir;
+pub mod field_kernels;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod stacked_reduction_kb;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod whir_kb;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod sumcheck_kb;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod poly_kb;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod matrix_kb;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod mle_interpolate_kb;
+#[cfg(feature = "koala-bear-poseidon2")]
+pub mod logup_zerocheck_kb;
 
 /// Log of warp size (32)
 pub const LOG_WARP_SIZE: usize = 5;

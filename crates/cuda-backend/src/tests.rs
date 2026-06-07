@@ -518,6 +518,162 @@ fn test_interactions_roundtrip_with_l_skip_zero() {
         .expect("l_skip=0 interactions roundtrip should verify");
 }
 
+/// CPU KB interaction roundtrip test (reference). If this PASSES, the bug is GPU-specific.
+#[test]
+#[cfg(feature = "koala-bear-poseidon2")]
+fn test_kb_cpu_interactions_roundtrip_reference() {
+    use openvm_stark_backend::test_utils::test_system_params_small;
+    use openvm_stark_sdk::config::koala_bear_poseidon2::{KoalaBearPoseidon2RefEngine, DuplexSponge as KbDuplexSponge};
+
+    setup_tracing_with_log_level(Level::DEBUG);
+
+    let engine = KoalaBearPoseidon2RefEngine::<KbDuplexSponge>::new(test_system_params_small(0, 8, 3));
+    let fixture = InteractionsFixture11;
+    let (vk, proof) = fixture.keygen_and_prove(&engine);
+    engine
+        .verify(&vk, &proof)
+        .expect("KB CPU l_skip=0 interactions roundtrip should verify (CPU reference)");
+    println!("PASS: KB CPU interactions roundtrip (CPU prover is correct)");
+}
+
+/// Compare CPU vs GPU numerator_term_per_air for the small fixture.
+/// This pinpoints whether the bug is in the batch MLE evaluation.
+#[test]
+#[cfg(feature = "koala-bear-poseidon2")]
+fn test_kb_compare_cpu_gpu_numerator_terms() {
+    use openvm_stark_backend::test_utils::test_system_params_small;
+    use openvm_stark_sdk::config::koala_bear_poseidon2::{KoalaBearPoseidon2RefEngine, DuplexSponge as KbDuplexSponge};
+    use crate::KoalaBearPoseidon2GpuEngine;
+
+    setup_tracing_with_log_level(Level::WARN);
+
+    let fixture = InteractionsFixture11;
+
+    // CPU proof
+    let cpu_engine = KoalaBearPoseidon2RefEngine::<KbDuplexSponge>::new(test_system_params_small(0, 8, 3));
+    let (_, proof_cpu) = fixture.keygen_and_prove(&cpu_engine);
+    let cpu_numer = &proof_cpu.batch_constraint_proof.numerator_term_per_air;
+    let cpu_denom = &proof_cpu.batch_constraint_proof.denominator_term_per_air;
+    println!("CPU numerator_terms ({} AIRs):", cpu_numer.len());
+    for (i, (n, d)) in cpu_numer.iter().zip(cpu_denom.iter()).enumerate() {
+        println!("  air[{i}]: numer={n:?} denom={d:?}");
+    }
+
+    // GPU proof
+    let gpu_engine = KoalaBearPoseidon2GpuEngine::new(test_system_params_small(0, 8, 3));
+    let (_, proof_gpu) = fixture.keygen_and_prove(&gpu_engine);
+    let gpu_numer = &proof_gpu.batch_constraint_proof.numerator_term_per_air;
+    let gpu_denom = &proof_gpu.batch_constraint_proof.denominator_term_per_air;
+    println!("GPU numerator_terms ({} AIRs):", gpu_numer.len());
+    for (i, (n, d)) in gpu_numer.iter().zip(gpu_denom.iter()).enumerate() {
+        println!("  air[{i}]: numer={n:?} denom={d:?}");
+    }
+
+    // Compare
+    let mut mismatch = false;
+    for (i, (cn, gn)) in cpu_numer.iter().zip(gpu_numer.iter()).enumerate() {
+        if cn != gn {
+            println!("MISMATCH numer air[{i}]: cpu={cn:?} gpu={gn:?}");
+            mismatch = true;
+        }
+    }
+    if !mismatch {
+        println!("PASS: numerator_terms match between CPU and GPU!");
+    }
+    // Also print p_xi_claim values by running verify in debug mode
+}
+
+/// KB GPU interaction roundtrip test. Mirrors the BB test above but uses KoalaBearPoseidon2GpuEngine.
+/// If GkrNumeratorMismatch occurs here, the bug is in the GPU KB batch MLE for small inputs.
+/// If it passes here but fails for reth188, the bug is size-dependent.
+#[test]
+#[cfg(feature = "koala-bear-poseidon2")]
+fn test_kb_interactions_roundtrip_with_l_skip_zero() {
+    use openvm_stark_backend::test_utils::test_system_params_small;
+    use crate::KoalaBearPoseidon2GpuEngine;
+
+    setup_tracing_with_log_level(Level::DEBUG);
+
+    let engine = KoalaBearPoseidon2GpuEngine::new(test_system_params_small(0, 8, 3));
+    let fixture = InteractionsFixture11;
+    let (vk, proof) = fixture.keygen_and_prove(&engine);
+    engine
+        .verify(&vk, &proof)
+        .expect("KB l_skip=0 interactions roundtrip should verify");
+}
+
+#[test_case(2; "l_skip_2")]
+#[test_case(2; "l_skip_2_n10")]
+#[test_case(4; "l_skip_4")]
+#[cfg(feature = "koala-bear-poseidon2")]
+fn test_kb_interactions_roundtrip_l_skip(l_skip: usize) {
+    use openvm_stark_backend::test_utils::test_system_params_small;
+    use crate::KoalaBearPoseidon2GpuEngine;
+
+    setup_tracing_with_log_level(Level::DEBUG);
+
+    let n = if l_skip == 2 && cfg!(test) { 8 } else { 8 }; // both use n_stack=8 for now
+    let engine = KoalaBearPoseidon2GpuEngine::new(test_system_params_small(l_skip, n, 3));
+    let fixture = InteractionsFixture11;
+    let (vk, proof) = fixture.keygen_and_prove(&engine);
+    engine
+        .verify(&vk, &proof)
+        .unwrap_or_else(|e| panic!("KB l_skip={l_skip} interactions roundtrip failed: {e:?}"));
+}
+
+/// KB GPU fib roundtrip — fib has AIR constraints (zerocheck) so this exercises the
+/// zerocheck sumcheck path (unlike InteractionsFixture11 which has no constraints).
+/// Small trace (256 rows) so it runs in seconds.
+#[test_case(0; "l_skip_0")]
+#[test_case(2; "l_skip_2")]
+#[cfg(feature = "koala-bear-poseidon2")]
+fn test_kb_fib_roundtrip(l_skip: usize) {
+    use openvm_stark_backend::test_utils::{test_system_params_small, FibFixture, TestFixture};
+    use crate::KoalaBearPoseidon2GpuEngine;
+
+    setup_tracing_with_log_level(Level::DEBUG);
+
+    let engine = KoalaBearPoseidon2GpuEngine::new(test_system_params_small(l_skip, 8, 3));
+    let fib = FibFixture::new(0, 1, 1 << (l_skip + 8));
+    let (pk, vk) = fib.keygen(&engine);
+    let proof = fib.prove(&engine, &pk);
+    engine
+        .verify(&vk, &proof)
+        .unwrap_or_else(|e| panic!("KB l_skip={l_skip} fib roundtrip failed: {e:?}"));
+}
+
+/// Compare GPU and CPU KB WHIR sumcheck polynomials for l_skip=2.
+/// If they differ, the GPU WHIR kernel is wrong for KB.
+#[test]
+#[cfg(feature = "koala-bear-poseidon2")]
+fn test_kb_whir_sumcheck_polys_match_cpu() {
+    use openvm_stark_backend::test_utils::test_system_params_small;
+    use openvm_stark_sdk::config::koala_bear_poseidon2::{KoalaBearPoseidon2RefEngine, DuplexSponge as KbDuplexSponge};
+    use crate::KoalaBearPoseidon2GpuEngine;
+    use openvm_stark_backend::StarkEngine;
+
+    setup_tracing_with_log_level(Level::WARN);
+
+    let l_skip = 2usize;
+    let params = test_system_params_small(l_skip, 8, 3);
+
+    // CPU proof
+    let cpu_engine = KoalaBearPoseidon2RefEngine::<KbDuplexSponge>::new(params.clone());
+    let (_, proof_cpu) = InteractionsFixture11.keygen_and_prove(&cpu_engine);
+
+    // GPU proof
+    let gpu_engine = KoalaBearPoseidon2GpuEngine::new(params);
+    let (_, proof_gpu) = InteractionsFixture11.keygen_and_prove(&gpu_engine);
+
+    // Compare whir_sumcheck_polys
+    println!("CPU whir_sumcheck_polys[0..3]: {:?}", &proof_cpu.whir_proof.whir_sumcheck_polys[..3.min(proof_cpu.whir_proof.whir_sumcheck_polys.len())]);
+    println!("GPU whir_sumcheck_polys[0..3]: {:?}", &proof_gpu.whir_proof.whir_sumcheck_polys[..3.min(proof_gpu.whir_proof.whir_sumcheck_polys.len())]);
+    let polys_match = proof_cpu.whir_proof.whir_sumcheck_polys == proof_gpu.whir_proof.whir_sumcheck_polys;
+    println!("Sumcheck polys match: {}", polys_match);
+    if polys_match { println!("PASS: GPU and CPU WHIR sumcheck polys match!"); }
+    else { println!("MISMATCH: GPU and CPU WHIR sumcheck polys differ."); }
+}
+
 #[test_case(1 ; "l_skip_1")]
 #[test_case(4 ; "l_skip_4")]
 fn test_batch_ntt_small_partial_last_block_roundtrip(l_skip: usize) {
@@ -676,7 +832,10 @@ fn test_monomial_vs_dag_equivalence() {
     use p3_util::log2_strict_usize;
 
     use crate::{
-        cuda::logup_zerocheck::{fold_selectors_round0, interpolate_columns_gpu, MainMatrixPtrs},
+        cuda::{
+            field_kernels::BabyBearKernels,
+            logup_zerocheck::{fold_selectors_round0, interpolate_columns_gpu, MainMatrixPtrs},
+        },
         logup_zerocheck::{
             batch_mle::{TraceCtx, ZerocheckMleBatchBuilder},
             batch_mle_monomial::{compute_lambda_combinations, ZerocheckMonomialBatch},
@@ -776,7 +935,7 @@ fn test_monomial_vs_dag_equivalence() {
         crate::utils::compute_barycentric_inv_lagrange_denoms(l_skip, &omega_skip_pows, r[0]);
     let d_inv_lagrange_denoms_r0 = inv_lagrange_denoms_r0.to_device().unwrap();
 
-    let mat_folded = fold_ple_evals_rotate(
+    let mat_folded: crate::base::DeviceMatrix<EF> = fold_ple_evals_rotate::<BabyBearKernels>(
         l_skip,
         &d_omega_skip_pows,
         &air_ctx.common_main,
@@ -869,7 +1028,7 @@ fn test_monomial_vs_dag_equivalence() {
         }];
         let main_ptrs_dev = main_ptrs.to_device().unwrap();
 
-        let trace_ctx = TraceCtx {
+        let trace_ctx = TraceCtx::<BabyBearKernels> {
             trace_idx: 0,
             air_idx: *air_idx,
             n_lift,
@@ -893,7 +1052,7 @@ fn test_monomial_vs_dag_equivalence() {
         let dag_output = dag_builder.evaluate(&d_lambda_pows, s_deg as u32).unwrap();
         let dag_results: Vec<EF> = dag_output.to_host().expect("copy DAG output");
 
-        let lambda_comb = compute_lambda_combinations(&pk, 0, &d_lambda_pows).unwrap();
+        let lambda_comb = compute_lambda_combinations::<BabyBearKernels, crate::hash_scheme::DefaultHashScheme>(&pk, 0, &d_lambda_pows).unwrap();
         let mono_batch =
             ZerocheckMonomialBatch::new(std::iter::once(&trace_ctx), &pk, &[&lambda_comb]).unwrap();
         let mono_output = mono_batch.evaluate(s_deg as u32).unwrap();

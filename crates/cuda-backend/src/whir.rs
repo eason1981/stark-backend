@@ -17,22 +17,10 @@ use tracing::instrument;
 
 use crate::{
     base::DeviceMatrix,
-    cuda::{
-        batch_ntt_small::batch_ntt_small,
-        matrix::{batch_expand_pad, split_ext_to_base_col_major_matrix},
-        mle_interpolate::mle_interpolate_stage_ext,
-        poly::{eval_poly_ext_at_point_from_base, transpose_fp_to_fpext_vec},
-        whir::{
-            _whir_sumcheck_coeff_moments_required_temp_buffer_size, w_moments_accumulate,
-            whir_algebraic_batch_traces, whir_fold_coeffs_and_moments,
-            whir_sumcheck_coeff_moments_round,
-        },
-    },
+    cuda::field_kernels::FieldKernels,
     hash_scheme::GpuHashScheme,
     merkle_tree::{MerkleProofQueryDigest, MerkleTreeConstructor, MerkleTreeGpu},
-    ntt::batch_ntt,
-    poly::evals_eq_hypercube,
-    prelude::{D_EF, EF, F},
+    ntt_field::GpuNttField,
     sponge::GpuFiatShamirTranscript,
     stacked_pcs::rs_code_matrix,
     stacked_reduction::StackedPcsData2,
@@ -40,9 +28,9 @@ use crate::{
 };
 
 #[repr(C)]
-pub(crate) struct BatchingTracePacket {
+pub struct BatchingTracePacket<Val: Copy> {
     /// Pointer to trace device buffer
-    ptr: *const F,
+    ptr: *const Val,
     /// Trace height
     height: u32,
     /// Trace width
@@ -53,20 +41,23 @@ pub(crate) struct BatchingTracePacket {
     mu_idx: u32,
 }
 
+
 #[instrument(
     name = "prover.openings.whir",
     level = "info",
     skip_all,
     fields(phase = "prover")
 )]
-pub fn prove_whir_opening_gpu<HS, TS>(
+pub fn prove_whir_opening_gpu<FK, HS, TS>(
     params: &SystemParams,
     transcript: &mut TS,
-    mut stacked_per_commit: Vec<StackedPcsData2<HS::Digest>>,
-    u: &[EF],
+    mut stacked_per_commit: Vec<StackedPcsData2<FK::Val, HS::Digest>>,
+    u: &[FK::ValExt],
 ) -> Result<WhirProof<HS::SC>, WhirProverError>
 where
-    HS: GpuHashScheme,
+    FK: FieldKernels,
+    FK::ValExt: BasedVectorSpace<FK::Val>,
+    HS: GpuHashScheme<BaseField = FK::Val, ExtField = FK::ValExt>,
     TS: GpuFiatShamirTranscript<HS::SC>,
     HS::MerkleHash: MerkleTreeConstructor,
     HS::Digest: MerkleProofQueryDigest,
@@ -97,10 +88,11 @@ where
     let num_commits = stacked_per_commit.len();
 
     // The coefficient table of `\hat{f}` in the current WHIR round (MLE coefficient form).
-    let mut f_ple_evals = DeviceBuffer::<F>::with_capacity(height * D_EF);
+    let d_ef = <FK::ValExt as BasedVectorSpace<FK::Val>>::DIMENSION;
+    let mut f_ple_evals = DeviceBuffer::<FK::Val>::with_capacity(height * d_ef);
     // We algebraically batch all matrices together so we only need to interpolate one column vector
     {
-        let mut packets = Vec::new();
+        let mut packets: Vec<BatchingTracePacket<FK::Val>> = Vec::new();
         let mut total_stacked_width = 0u32;
         for stacked in &stacked_per_commit {
             let layout = stacked.layout();
@@ -125,7 +117,7 @@ where
         // - `f_ple_evals` has capacity `height * D_EF` (stacked height in base coordinates).
         // - `d_packets` contain valid pointers and stacked row indices by construction.
         unsafe {
-            whir_algebraic_batch_traces(&mut f_ple_evals, &d_packets, &d_mu_powers, 1 << l_skip)
+            FK::whir_algebraic_batch_traces(&mut f_ple_evals, &d_packets, &d_mu_powers, 1 << l_skip)
                 .map_err(WhirProverError::AlgebraicBatch)?;
         }
         for stacked in &mut stacked_per_commit {
@@ -136,32 +128,46 @@ where
         }
     } // common_main_pcs_data.matrix has now been freed
 
-    // Compute \hat{f} coefficients:
-    //
-    // Step 1: iDFT per chunk of size 2^l_skip. After this, each chunk holds univariate
-    // coefficients c_z(x) of f(Z, x) for a fixed boolean assignment x in H_{m - l_skip}.
+    // Compute \hat{f} coefficients.
+    let mut f_coeffs = DeviceBuffer::<FK::ValExt>::with_capacity(height);
+    // Step 1: iDFT per chunk of size 2^l_skip.
+    // For KB (use_cpu_gkr), batch_ntt_small uses CPU iDFT (correct).
+    // For BB, batch_ntt_small uses GPU kernel (correct).
     unsafe {
         let num_poly = f_ple_evals.len() >> l_skip;
-        batch_ntt_small(&mut f_ple_evals, l_skip, num_poly, true)
+        FK::Val::batch_ntt_small(&mut f_ple_evals, l_skip, num_poly, true)
             .map_err(WhirProverError::CustomBatchIntt)?;
     }
-    let mut f_coeffs = DeviceBuffer::<EF>::with_capacity(height);
     // SAFETY: `f_ple_evals` is constructed with length `height * D_EF`.
     unsafe {
-        transpose_fp_to_fpext_vec(&mut f_coeffs, &f_ple_evals)
+        FK::transpose_fp_to_fpext_vec(&mut f_coeffs, &f_ple_evals)
             .map_err(WhirProverError::Transpose)?;
     }
     drop(f_ple_evals);
-    // Step 2: Within-chunk zeta (stages 0..l_skip). Applies the subset-zeta transform
-    // over the Z-index bits, converting univariate coefficients (root-of-unity basis)
-    // into hypercube evaluations over H_{l_skip}. Together with step 1, this computes
-    // eval_to_coeff_rs_message, i.e. the MLE coefficient table of \hat{f}.
-    for i in 0..l_skip {
-        let step = 1u32 << i;
-        // SAFETY: `f_coeffs` has length `2^m` with `m >= l_skip`.
-        unsafe {
-            mle_interpolate_stage_ext(&mut f_coeffs, step, false)
-                .map_err(|error| WhirProverError::MleInterpolate { error, step })?;
+    // Step 2: Within-chunk zeta (stages 0..l_skip).
+    if FK::use_cpu_gkr() && l_skip > 0 {
+        // CPU fallback for KB: mle_interpolate_stage_ext may have KB EF arithmetic bugs.
+        // is_eval_to_coeff=false: for each group of 2*step, do buffer[step+j] += buffer[j].
+        let mut fc_cpu = f_coeffs.to_host().map_err(WhirProverError::MemCopy)?;
+        for i in 0..l_skip {
+            let step = 1usize << i;
+            let mut base = 0usize;
+            while base < fc_cpu.len() {
+                for j in 0..step {
+                    let u = fc_cpu[base + j];
+                    fc_cpu[base + step + j] += u;
+                }
+                base += 2 * step;
+            }
+        }
+        f_coeffs = fc_cpu.to_device().map_err(WhirProverError::MemCopy)?;
+    } else {
+        for i in 0..l_skip {
+            let step = 1u32 << i;
+            unsafe {
+                FK::mle_interpolate_stage_ext(&mut f_coeffs, step, false)
+                    .map_err(|error| WhirProverError::MleInterpolate { error, step })?;
+            }
         }
     }
 
@@ -172,18 +178,18 @@ where
     // We maintain moments of \hat{w}:
     // M[T] = sum_{x superset T} \hat{w}(x).
     // For initial \hat{w} = mobius_eq(u, -), these moments are exactly eq(u, -).
-    let mut w_moments = DeviceBuffer::<EF>::with_capacity(1 << m);
+    let mut w_moments = DeviceBuffer::<FK::ValExt>::with_capacity(1 << m);
     unsafe {
-        evals_eq_hypercube(&mut w_moments, u).map_err(WhirProverError::EvalEq)?;
+        FK::evals_eq_hypercube(&mut w_moments, u).map_err(WhirProverError::EvalEq)?;
     }
 
-    let mut whir_sumcheck_polys: Vec<[EF; 2]> = vec![];
+    let mut whir_sumcheck_polys: Vec<[FK::ValExt; 2]> = vec![];
     let mut codeword_commits = vec![];
     let mut ood_values = vec![];
     // per commitment, per whir query, per column
-    let mut initial_round_opened_rows: Vec<Vec<Vec<Vec<F>>>> = vec![vec![]; num_commits];
+    let mut initial_round_opened_rows: Vec<Vec<Vec<Vec<FK::Val>>>> = vec![vec![]; num_commits];
     let mut initial_round_merkle_proofs: Vec<Vec<MerkleProof<HS::Digest>>> = vec![];
-    let mut codeword_opened_values: Vec<Vec<Vec<EF>>> = vec![];
+    let mut codeword_opened_values: Vec<Vec<Vec<FK::ValExt>>> = vec![];
     let mut codeword_merkle_proofs: Vec<Vec<MerkleProof<HS::Digest>>> = vec![];
     let mut folding_pow_witnesses = vec![];
     let mut query_phase_pow_witnesses = vec![];
@@ -191,8 +197,8 @@ where
     let mut log_rs_domain_size = m + log_blowup;
     let mut final_poly = None;
 
-    let mut d_s_evals = DeviceBuffer::<EF>::with_capacity(2);
-    let mut d_sumcheck_tmp = DeviceBuffer::<EF>::new();
+    let mut d_s_evals = DeviceBuffer::<FK::ValExt>::with_capacity(2);
+    let mut d_sumcheck_tmp = DeviceBuffer::<FK::ValExt>::new();
 
     mem.tracing_info("before_whir_rounds");
     // We will drop `stacked_per_commit` and hence `common_main_pcs_data` after whir round 0.
@@ -210,18 +216,20 @@ where
             );
             debug_assert!(w_moments.len() >= f_height);
             let output_height = f_height / 2;
+
             let tmp_buffer_capacity =
-                unsafe { _whir_sumcheck_coeff_moments_required_temp_buffer_size(f_height as u32) };
+                FK::whir_sumcheck_coeff_moments_required_temp_buffer_size(f_height as u32);
             if d_sumcheck_tmp.len() < tmp_buffer_capacity as usize {
-                d_sumcheck_tmp = DeviceBuffer::<EF>::with_capacity(tmp_buffer_capacity as usize);
+                d_sumcheck_tmp =
+                    DeviceBuffer::<FK::ValExt>::with_capacity(tmp_buffer_capacity as usize);
             }
-            let mut new_f_coeffs = DeviceBuffer::<EF>::with_capacity(output_height);
-            let mut new_w_moments = DeviceBuffer::<EF>::with_capacity(output_height);
+            let mut new_f_coeffs = DeviceBuffer::<FK::ValExt>::with_capacity(output_height);
+            let mut new_w_moments = DeviceBuffer::<FK::ValExt>::with_capacity(output_height);
             // SAFETY:
             // - `d_s_evals` has length 2
             // - `d_sumcheck_tmp` has at least required scratch length
             unsafe {
-                whir_sumcheck_coeff_moments_round(
+                FK::whir_sumcheck_coeff_moments_round(
                     &f_coeffs,
                     &w_moments,
                     &mut d_s_evals,
@@ -252,7 +260,7 @@ where
             // - input buffers have length `f_height`.
             // - output buffers have length `f_height / 2`.
             unsafe {
-                whir_fold_coeffs_and_moments(
+                FK::whir_fold_coeffs_and_moments(
                     &f_coeffs,
                     &w_moments,
                     &mut new_f_coeffs,
@@ -273,12 +281,12 @@ where
         // `f_coeffs` is the coefficient form of f^(alpha, \cdot).
         let f_height = 1 << (m - k_whir);
         debug_assert!(f_coeffs.len() >= f_height);
-        debug_assert_eq!(size_of::<EF>() / size_of::<F>(), D_EF);
-        let mut g_coeffs = DeviceBuffer::<F>::with_capacity(f_height * D_EF);
-        // SAFETY: we allocated `f_coeffs.len() * D_EF` space for `g_coeffs` to do a 1-to-D_EF
+        debug_assert_eq!(std::mem::size_of::<FK::ValExt>() / std::mem::size_of::<FK::Val>(), d_ef);
+        let mut g_coeffs = DeviceBuffer::<FK::Val>::with_capacity(f_height * d_ef);
+        // SAFETY: we allocated `f_coeffs.len() * d_ef` space for `g_coeffs` to do a 1-to-d_ef
         // (1-to-4) split
         unsafe {
-            split_ext_to_base_col_major_matrix(
+            FK::split_ext_to_base_col_major_matrix(
                 &mut g_coeffs,
                 &f_coeffs,
                 f_height as u64,
@@ -289,34 +297,34 @@ where
         let (g_tree, z_0) = if !is_last_round {
             let codeword_height = 1 << (log_rs_domain_size - 1);
             // `g: \mathcal{L}^{(2)} \to \mathbb F`
-            let g_rs = DeviceBuffer::<F>::with_capacity(D_EF * codeword_height);
+            let g_rs = DeviceBuffer::<FK::Val>::with_capacity(d_ef * codeword_height);
             // SAFETY:
-            // - g_coeffs is a single EF polynomial, treated as 4 F-polynomials of height
+            // - g_coeffs is a single EF polynomial, treated as d_ef F-polynomials of height
             //   2^{m-k_whir}
             // - We resize each F-poly to RS domain size 2^{log_rs_domain_size - 1}, which is
             //   equivalent to resizing the EF-polynomial
             unsafe {
-                batch_expand_pad(
+                FK::batch_expand_pad(
                     g_rs.as_mut_ptr(),
                     g_coeffs.as_ptr(),
-                    D_EF as u32,
+                    d_ef as u32,
                     codeword_height as u32,
                     f_height as u32,
                 )
                 .map_err(|error| WhirProverError::BatchExpandPad { error, whir_round })?;
 
-                batch_ntt(
+                FK::Val::batch_ntt(
                     &g_rs,
                     (log_rs_domain_size - 1) as u32,
                     0u32,
-                    D_EF as u32,
+                    d_ef as u32,
                     true,
                     false,
                 );
             }
 
-            let g_tree = MerkleTreeGpu::<F, HS::Digest>::new_with_hash::<HS::MerkleHash>(
-                DeviceMatrix::new(Arc::new(g_rs), codeword_height, D_EF),
+            let g_tree = MerkleTreeGpu::<FK::Val, HS::Digest>::new_with_hash::<HS::MerkleHash>(
+                DeviceMatrix::new(Arc::new(g_rs), codeword_height, d_ef),
                 1 << k_whir,
                 true,
             )
@@ -330,7 +338,7 @@ where
             // - `g_coeffs` is coefficient form of `\hat{g}`, which is degree `2^{m-k_whir}`.
             // - `g_coeffs` is F-column major matrix.
             let g_opened_value = unsafe {
-                eval_poly_ext_at_point_from_base(&g_coeffs, 1 << (m - k_whir), z_0)
+                FK::eval_poly_ext_at_point_from_base(&g_coeffs, 1 << (m - k_whir), z_0)
                     .map_err(|error| WhirProverError::EvalPolyAtPoint { error, whir_round })?
             };
             transcript.observe_ext(g_opened_value);
@@ -342,10 +350,11 @@ where
             debug_assert_eq!(log_final_poly_len, m - k_whir);
             let final_poly_len = 1 << log_final_poly_len;
             let base_coeffs = g_coeffs.to_host()?;
-            debug_assert_eq!(base_coeffs.len(), D_EF * final_poly_len);
+            debug_assert_eq!(base_coeffs.len(), d_ef * final_poly_len);
             let mut coeffs = Vec::with_capacity(final_poly_len);
             for i in 0..final_poly_len {
-                let coeff = EF::from_basis_coefficients_fn(|j| base_coeffs[j * final_poly_len + i]);
+                let coeff =
+                    FK::ValExt::from_basis_coefficients_fn(|j| base_coeffs[j * final_poly_len + i]);
                 transcript.observe_ext(coeff);
                 coeffs.push(coeff);
             }
@@ -354,7 +363,7 @@ where
         };
 
         // omega is generator of RS domain `\mathcal{L}^{(2^k)}`
-        let omega = F::two_adic_generator(log_rs_domain_size - k_whir);
+        let omega = FK::Val::two_adic_generator(log_rs_domain_size - k_whir);
         let num_queries = round_params.num_queries;
         let mut query_indices = Vec::with_capacity(num_queries);
         query_phase_pow_witnesses.push(
@@ -397,7 +406,7 @@ where
             // Get merkle proofs for in-domain samples necessary to evaluate Fold(f, \vec
             // \alpha)(z_i)
             initial_round_merkle_proofs =
-                <MerkleTreeGpu<F, HS::Digest>>::batch_query_merkle_proofs(
+                <MerkleTreeGpu<FK::Val, HS::Digest>>::batch_query_merkle_proofs(
                     trees.as_slice(),
                     &query_indices,
                 )
@@ -416,7 +425,7 @@ where
                 "Merkle trees don't have same rows_per_query"
             );
 
-            initial_round_opened_rows = MerkleTreeGpu::<F, HS::Digest>::batch_open_rows(
+            initial_round_opened_rows = MerkleTreeGpu::<FK::Val, HS::Digest>::batch_open_rows(
                 &backing_matrices,
                 &query_indices,
                 query_stride,
@@ -442,14 +451,17 @@ where
             stacked_per_commit.clear(); // this drops common_main_pcs_data
             mem.tracing_info("after_initial_whir_round");
         } else {
-            let tree: &MerkleTreeGpu<F, HS::Digest> = rs_tree.as_ref().unwrap();
+            let tree: &MerkleTreeGpu<FK::Val, HS::Digest> = rs_tree.as_ref().unwrap();
             codeword_merkle_proofs[whir_round - 1] =
-                <MerkleTreeGpu<F, HS::Digest>>::batch_query_merkle_proofs(&[tree], &query_indices)
-                    .map_err(WhirProverError::MerkleTree)?
-                    .pop()
-                    .expect("exactly 1 tree");
+                <MerkleTreeGpu<FK::Val, HS::Digest>>::batch_query_merkle_proofs(
+                    &[tree],
+                    &query_indices,
+                )
+                .map_err(WhirProverError::MerkleTree)?
+                .pop()
+                .expect("exactly 1 tree");
             codeword_opened_values[whir_round - 1] =
-                MerkleTreeGpu::<F, HS::Digest>::batch_open_rows(
+                MerkleTreeGpu::<FK::Val, HS::Digest>::batch_open_rows(
                     &[tree.backing_matrix.as_ref().unwrap()],
                     &query_indices,
                     tree.query_stride(),
@@ -459,7 +471,7 @@ where
                 .pop()
                 .unwrap()
                 .into_iter()
-                .map(EF::reconstitute_from_base)
+                .map(FK::ValExt::reconstitute_from_base)
                 .collect();
         }
         rs_tree = g_tree;
@@ -498,7 +510,7 @@ where
             let d_z0_pows2 = z0_pows2.to_device()?;
             let d_z_pows2 = z_pows2.to_device()?;
             unsafe {
-                w_moments_accumulate(
+                FK::w_moments_accumulate(
                     &mut w_moments,
                     &d_z0_pows2,
                     &d_z_pows2,
@@ -641,7 +653,7 @@ mod tests {
 
         let mut prover_sponge = DuplexSpongeGpu::default();
 
-        let proof = prove_whir_opening_gpu::<crate::DefaultHashScheme, _>(
+        let proof = prove_whir_opening_gpu::<crate::cuda::field_kernels::BabyBearKernels, crate::DefaultHashScheme, _>(
             &params,
             &mut prover_sponge,
             stacked_per_commit,

@@ -766,6 +766,39 @@ impl VirtualMemoryPool {
         Ok(remapped_ptr)
     }
 
+    /// Release all free (unmapped but still physically backed) regions back to the device.
+    /// Call after `cudaDeviceSynchronize()` to ensure no pending operations use the freed pages.
+    /// This reduces the VPMM's physical memory footprint, preventing OOM when proving many chunks.
+    pub(super) fn release_free_pages(&mut self) {
+        let page_size = self.page_size;
+        let free_regions: Vec<(CUdeviceptr, usize)> = self
+            .free_regions
+            .iter()
+            .map(|(&ptr, meta)| (ptr, meta.size))
+            .collect();
+
+        for (ptr, size) in free_regions {
+            // Unmap and release each page in this free region
+            let mut page_ptr = ptr;
+            while page_ptr < ptr + size as u64 {
+                if let Some(handle) = self.active_pages.remove(&page_ptr) {
+                    unsafe {
+                        if let Err(e) = vpmm_unmap(page_ptr, page_size) {
+                            tracing::warn!("release_free_pages: unmap failed {:?}", e);
+                        }
+                        if let Err(e) = vpmm_release(handle) {
+                            tracing::warn!("release_free_pages: release failed {:?}", e);
+                        }
+                    }
+                }
+                page_ptr += page_size as u64;
+            }
+            // Move VA range to unmapped (available for future re-backing)
+            self.insert_unmapped_region(ptr, size);
+        }
+        self.free_regions.clear();
+    }
+
     /// Returns the total physical memory currently mapped in this pool (in bytes).
     pub(super) fn memory_usage(&self) -> usize {
         self.active_pages.len() * self.page_size

@@ -526,3 +526,170 @@ mod tests {
         eprintln!("{}\n", "=".repeat(60));
     }
 }
+
+// ─── KoalaBear GPU sponge ────────────────────────────────────────────────────
+
+#[cfg(feature = "koala-bear-poseidon2")]
+pub use kb_sponge::*;
+
+#[cfg(feature = "koala-bear-poseidon2")]
+mod kb_sponge {
+    use openvm_cuda_common::{copy::cuda_memcpy, d_buffer::DeviceBuffer, error::MemCopyError};
+    use openvm_stark_backend::{FiatShamirTranscript, StarkProtocolConfig};
+    use openvm_stark_sdk::config::koala_bear_poseidon2::{
+        default_koalabear_poseidon2_16, DuplexSponge as KbDuplexSponge, KoalaBearPoseidon2Config,
+    };
+    use p3_field::{PrimeCharacteristicRing, PrimeField32};
+    use p3_koala_bear::KoalaBear;
+    use p3_symmetric::Permutation;
+    use std::ffi::c_void;
+
+    use super::GrindError;
+    use super::GpuFiatShamirTranscript;  // defined in sponge.rs itself
+
+    const KB_WIDTH: usize = 16;
+    const KB_CHUNK: usize = 8;
+
+    /// Device-side KoalaBear sponge state — matches `KbDeviceSpongeState` in sponge_kb.cu.
+    #[repr(C)]
+    #[derive(Clone, Debug)]
+    pub struct KbDeviceSpongeState {
+        pub state: [KoalaBear; KB_WIDTH],
+        pub absorb_idx: u32,
+        pub sample_idx: u32,
+    }
+
+    impl Default for KbDeviceSpongeState {
+        fn default() -> Self {
+            Self {
+                state: [KoalaBear::default(); KB_WIDTH],
+                absorb_idx: 0,
+                sample_idx: 0,
+            }
+        }
+    }
+
+    impl KbDeviceSpongeState {
+        pub fn observe(&mut self, value: KoalaBear) {
+            self.state[self.absorb_idx as usize] = value;
+            self.absorb_idx += 1;
+            if self.absorb_idx == KB_CHUNK as u32 {
+                default_koalabear_poseidon2_16().permute_mut(&mut self.state);
+                self.absorb_idx = 0;
+                self.sample_idx = KB_CHUNK as u32;
+            }
+        }
+
+        pub fn sample(&mut self) -> KoalaBear {
+            if self.absorb_idx != 0 || self.sample_idx == 0 {
+                default_koalabear_poseidon2_16().permute_mut(&mut self.state);
+                self.absorb_idx = 0;
+                self.sample_idx = KB_CHUNK as u32;
+            }
+            self.sample_idx -= 1;
+            self.state[self.sample_idx as usize]
+        }
+    }
+
+    /// KoalaBear GPU-accelerated duplex sponge.
+    ///
+    /// Uses the same pattern as `DuplexSpongeGpu` but with KoalaBear field and Poseidon2
+    /// (alpha=3, 20 partial rounds). GPU grinding uses `_kb_sponge_grind` kernel.
+    #[derive(Debug)]
+    pub struct KoalaBearDuplexSpongeGpu {
+        host: KbDuplexSponge,
+        device: DeviceBuffer<KbDeviceSpongeState>,
+    }
+
+    impl Default for KoalaBearDuplexSpongeGpu {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Clone for KoalaBearDuplexSpongeGpu {
+        fn clone(&self) -> Self {
+            Self {
+                host: self.host.clone(),
+                device: DeviceBuffer::new(),
+            }
+        }
+    }
+
+    impl KoalaBearDuplexSpongeGpu {
+        pub fn new() -> Self {
+            Self {
+                host: KbDuplexSponge::from(default_koalabear_poseidon2_16()),
+                device: DeviceBuffer::new(),
+            }
+        }
+
+        fn ensure_device_allocated(&mut self) {
+            if self.device.is_empty() {
+                self.device = DeviceBuffer::with_capacity(1);
+            }
+        }
+
+        /// Sync host KbDuplexSponge state to the device-side KbDeviceSpongeState.
+        pub fn sync_h2d(&mut self) -> Result<(), MemCopyError> {
+            self.ensure_device_allocated();
+            // DuplexSponge exposes state(), absorb_idx(), sample_idx() accessors.
+            // Copy the current host transcript state to device so the GPU grinding
+            // kernel operates on the correct Fiat-Shamir state.
+            let device_state = KbDeviceSpongeState {
+                state: *self.host.state(),
+                absorb_idx: self.host.absorb_idx() as u32,
+                sample_idx: self.host.sample_idx() as u32,
+            };
+            unsafe {
+                cuda_memcpy::<false, true>(
+                    self.device.as_mut_ptr() as *mut c_void,
+                    &device_state as *const KbDeviceSpongeState as *const c_void,
+                    std::mem::size_of::<KbDeviceSpongeState>(),
+                )
+            }
+        }
+
+        /// Proof-of-work grinding using CPU.
+        ///
+        /// The KB GPU kernel checks `val & mask == 0` (Montgomery-form bits) while the CPU
+        /// verifier checks `as_canonical_u64() & mask == 0` (canonical bits). These differ, so
+        /// the GPU kernel would produce witnesses that fail CPU verification. We use the CPU
+        /// path here to guarantee the witness satisfies the verifier's canonical-bit check.
+        ///
+        /// Performance: CPU grinding with rayon takes ~100ms for 18 bits, which is negligible
+        /// compared to the ~4s per-chunk GPU prove time.
+        pub fn grind_gpu_impl(&mut self, bits: usize) -> Result<KoalaBear, GrindError> {
+            let witness = FiatShamirTranscript::<KoalaBearPoseidon2Config>::grind(
+                &mut self.host,
+                bits,
+            );
+            Ok(witness)
+        }
+    }
+
+    impl FiatShamirTranscript<KoalaBearPoseidon2Config> for KoalaBearDuplexSpongeGpu {
+        #[inline]
+        fn observe(&mut self, value: KoalaBear) {
+            FiatShamirTranscript::<KoalaBearPoseidon2Config>::observe(&mut self.host, value);
+        }
+
+        #[inline]
+        fn sample(&mut self) -> KoalaBear {
+            FiatShamirTranscript::<KoalaBearPoseidon2Config>::sample(&mut self.host)
+        }
+
+        #[inline]
+        fn observe_commit(&mut self, digest: [KoalaBear; 8]) {
+            for x in digest {
+                self.observe(x);
+            }
+        }
+    }
+
+    impl super::GpuFiatShamirTranscript<KoalaBearPoseidon2Config> for KoalaBearDuplexSpongeGpu {
+        fn grind_gpu(&mut self, bits: usize) -> Result<KoalaBear, super::GrindError> {
+            self.grind_gpu_impl(bits)
+        }
+    }
+}

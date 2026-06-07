@@ -94,6 +94,27 @@ pub unsafe fn matrix_transpose_fp(
     ))
 }
 
+/// Generic version of `matrix_transpose_fp` for any 4-byte element type.
+///
+/// # Safety
+/// - `T` must have same size as `F` (4 bytes, `#[repr(transparent)]` over u32)
+/// - `input` and `output` must not overlap
+/// - Both must have capacity at least `width * height`
+pub unsafe fn matrix_transpose_fp_any<T>(
+    output: &DeviceBuffer<T>,
+    input: &DeviceBuffer<T>,
+    width: usize,
+    height: usize,
+) -> Result<(), CudaError> {
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<F>());
+    CudaError::from_result(_matrix_transpose_fp(
+        output.as_mut_ptr() as *mut F,
+        input.as_ptr() as *const F,
+        width,
+        height,
+    ))
+}
+
 /// Safety:
 /// - `input` and `output` must not overlap.
 /// - `input` and `output` must each have capacity at least `width * height`.
@@ -224,6 +245,33 @@ pub unsafe fn collapse_strided_matrix(
     ))
 }
 
+/// Generic version of `collapse_strided_matrix` that works for any 4-byte element type.
+///
+/// The CUDA kernel only copies bytes without any field-specific arithmetic, so it is
+/// safe to use with any `T` that has the same size as `F` (4 bytes).
+pub unsafe fn collapse_strided_matrix_any<T>(
+    output: *mut T,
+    input: *const T,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<(), CudaError> {
+    // Safety: T has the same size as F (both are 4-byte field elements).
+    // The kernel operates on raw bytes so the field semantics don't matter.
+    assert_eq!(
+        std::mem::size_of::<T>(),
+        std::mem::size_of::<F>(),
+        "collapse_strided_matrix_any: T must have same size as F"
+    );
+    CudaError::from_result(_collapse_strided_matrix(
+        output as *mut F,
+        input as *const F,
+        width,
+        height,
+        stride,
+    ))
+}
+
 pub unsafe fn batch_expand_pad(
     output: *mut F,
     input: *const F,
@@ -233,6 +281,24 @@ pub unsafe fn batch_expand_pad(
 ) -> Result<(), CudaError> {
     CudaError::from_result(_batch_expand_pad(
         output, input, poly_count, out_size, in_size,
+    ))
+}
+
+/// Generic version of `batch_expand_pad` for any 4-byte element type.
+pub unsafe fn batch_expand_pad_any<T>(
+    output: *mut T,
+    input: *const T,
+    poly_count: u32,
+    out_size: u32,
+    in_size: u32,
+) -> Result<(), CudaError> {
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<F>());
+    CudaError::from_result(_batch_expand_pad(
+        output as *mut F,
+        input as *const F,
+        poly_count,
+        out_size,
+        in_size,
     ))
 }
 
@@ -254,6 +320,25 @@ pub unsafe fn batch_expand_pad_wide(
     CudaError::from_result(_batch_expand_pad_wide(
         out,
         input,
+        width,
+        padded_height,
+        height,
+    ))
+}
+
+/// Generic version of `batch_expand_pad_wide` for any 4-byte element type.
+pub unsafe fn batch_expand_pad_wide_any<T>(
+    out: *mut T,
+    input: *const T,
+    width: u32,
+    padded_height: u32,
+    height: u32,
+) -> Result<(), CudaError> {
+    debug_assert!(padded_height > height);
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<F>());
+    CudaError::from_result(_batch_expand_pad_wide(
+        out as *mut F,
+        input as *const F,
         width,
         padded_height,
         height,

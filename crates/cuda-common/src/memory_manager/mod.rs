@@ -144,6 +144,16 @@ pub fn d_malloc(size: usize) -> Result<*mut c_void, MemoryError> {
     manager.d_malloc(size)
 }
 
+/// Release all free (physically backed but unused) pages in the VPMM pool.
+/// Call after device synchronization to prevent VRAM accumulation across chunk proves.
+pub fn release_free_vpmm_pages() {
+    if let Some(manager) = MEMORY_MANAGER.get() {
+        if let Ok(mut manager) = manager.lock() {
+            manager.pool.release_free_pages();
+        }
+    }
+}
+
 /// # Safety
 /// The pointer `ptr` must be a valid, previously allocated device pointer.
 /// The caller must ensure that `ptr` is not used after this function is called.

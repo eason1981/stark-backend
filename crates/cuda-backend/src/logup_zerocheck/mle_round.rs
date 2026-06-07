@@ -3,13 +3,8 @@ use openvm_stark_backend::prover::fractional_sumcheck_gkr::Frac;
 use tracing::debug;
 
 use crate::{
-    cuda::logup_zerocheck::{
-        _logup_mle_intermediates_buffer_size, _logup_mle_temp_sums_buffer_size,
-        _zerocheck_mle_intermediates_buffer_size, _zerocheck_mle_temp_sums_buffer_size,
-        logup_eval_mle, zerocheck_eval_mle, MainMatrixPtrs,
-    },
+    cuda::{field_kernels::FieldKernels, logup_zerocheck::MainMatrixPtrs},
     error::KernelError,
-    prelude::{EF, F},
     ConstraintOnlyRules, InteractionEvalRules,
 };
 
@@ -29,34 +24,38 @@ fn validate_mle_num_x(num_x: u32) -> Result<(), KernelError> {
 /// Takes device pointers directly, avoiding H2D copies when data is already on device.
 /// See [`crate::logup_zerocheck`] module docs for async-free/peak memory behavior.
 #[allow(clippy::too_many_arguments)]
-pub fn evaluate_mle_constraints_gpu(
-    eq_xi_ptr: *const EF,
-    sels_ptr: *const EF,
-    prep_ptr: MainMatrixPtrs<EF>,
-    d_main_ptrs: &DeviceBuffer<MainMatrixPtrs<EF>>,
-    public_ptr: *const F,
-    lambda_pows: &DeviceBuffer<EF>,
+pub fn evaluate_mle_constraints_gpu<FK: FieldKernels>(
+    eq_xi_ptr: *const FK::ValExt,
+    sels_ptr: *const FK::ValExt,
+    prep_ptr: MainMatrixPtrs<FK::ValExt>,
+    d_main_ptrs: &DeviceBuffer<MainMatrixPtrs<FK::ValExt>>,
+    public_ptr: *const FK::Val,
+    lambda_pows: &DeviceBuffer<FK::ValExt>,
     rules: &ConstraintOnlyRules<ZEROCHECK_BUFFER_VARS>,
     num_y: u32,
     num_x: u32,
-) -> Result<DeviceBuffer<EF>, KernelError> {
+) -> Result<DeviceBuffer<FK::ValExt>, KernelError> {
     validate_mle_num_x(num_x)?;
     let buffer_size = rules.inner.buffer_size;
+    // TODO: FK::zerocheck_mle_intermediates_buffer_size — add this method to FieldKernels trait
     let intermed_capacity =
-        unsafe { _zerocheck_mle_intermediates_buffer_size(buffer_size, num_x, num_y) };
+        unsafe { FK::zerocheck_mle_intermediates_buffer_size(buffer_size, num_x, num_y) };
     let mut intermediates = if intermed_capacity > 0 {
         debug!("zerocheck:intermediates_capacity={intermed_capacity}");
-        DeviceBuffer::<EF>::with_capacity(intermed_capacity)
+        DeviceBuffer::<FK::ValExt>::with_capacity(intermed_capacity)
     } else {
-        DeviceBuffer::<EF>::new()
+        DeviceBuffer::<FK::ValExt>::new()
     };
-    let temp_sums_buffer_capacity = unsafe { _zerocheck_mle_temp_sums_buffer_size(num_x, num_y) };
+    // TODO: FK::zerocheck_mle_temp_sums_buffer_size — add this method to FieldKernels trait
+    let temp_sums_buffer_capacity =
+        unsafe { FK::zerocheck_mle_temp_sums_buffer_size(num_x, num_y) };
     debug!("zerocheck:temp_sums_buffer_capacity={temp_sums_buffer_capacity}");
-    let mut temp_sums_buffer = DeviceBuffer::<EF>::with_capacity(temp_sums_buffer_capacity);
-    let mut output = DeviceBuffer::<EF>::with_capacity(num_x as usize);
+    let mut temp_sums_buffer = DeviceBuffer::<FK::ValExt>::with_capacity(temp_sums_buffer_capacity);
+    let mut output = DeviceBuffer::<FK::ValExt>::with_capacity(num_x as usize);
 
+    // TODO: FK::zerocheck_eval_mle — add this method to FieldKernels trait
     unsafe {
-        zerocheck_eval_mle(
+        FK::zerocheck_eval_mle(
             &mut temp_sums_buffer,
             &mut output,
             eq_xi_ptr,
@@ -84,35 +83,40 @@ pub fn evaluate_mle_constraints_gpu(
 /// Takes device pointers directly, avoiding H2D copies when data is already on device.
 /// See [`crate::logup_zerocheck`] module docs for async-free/peak memory behavior.
 #[allow(clippy::too_many_arguments)]
-pub fn evaluate_mle_interactions_gpu(
-    eq_xi_ptr: *const EF,
-    sels_ptr: *const EF,
-    prep_ptr: MainMatrixPtrs<EF>,
-    d_main_ptrs: &DeviceBuffer<MainMatrixPtrs<EF>>,
-    public_ptr: *const F,
-    challenges_ptr: *const EF,
-    eq_3bs_ptr: *const EF,
+pub fn evaluate_mle_interactions_gpu<FK: FieldKernels>(
+    eq_xi_ptr: *const FK::ValExt,
+    sels_ptr: *const FK::ValExt,
+    prep_ptr: MainMatrixPtrs<FK::ValExt>,
+    d_main_ptrs: &DeviceBuffer<MainMatrixPtrs<FK::ValExt>>,
+    public_ptr: *const FK::Val,
+    challenges_ptr: *const FK::ValExt,
+    eq_3bs_ptr: *const FK::ValExt,
     rules: &InteractionEvalRules,
     num_y: u32,
     num_x: u32,
-) -> Result<DeviceBuffer<Frac<EF>>, KernelError> {
+) -> Result<DeviceBuffer<Frac<FK::ValExt>>, KernelError> {
     validate_mle_num_x(num_x)?;
     let buffer_size = rules.inner.buffer_size;
+    // TODO: FK::logup_mle_intermediates_buffer_size — add this method to FieldKernels trait
     let intermed_capacity =
-        unsafe { _logup_mle_intermediates_buffer_size(buffer_size, num_x, num_y) };
+        unsafe { FK::logup_mle_intermediates_buffer_size(buffer_size, num_x, num_y) };
     let mut intermediates = if intermed_capacity > 0 {
         debug!("logup:intermediates_capacity={intermed_capacity}");
-        DeviceBuffer::<EF>::with_capacity(intermed_capacity)
+        DeviceBuffer::<FK::ValExt>::with_capacity(intermed_capacity)
     } else {
-        DeviceBuffer::<EF>::new()
+        DeviceBuffer::<FK::ValExt>::new()
     };
-    let temp_sums_buffer_capacity = unsafe { _logup_mle_temp_sums_buffer_size(num_x, num_y) };
+    // TODO: FK::logup_mle_temp_sums_buffer_size — add this method to FieldKernels trait
+    let temp_sums_buffer_capacity =
+        unsafe { FK::logup_mle_temp_sums_buffer_size(num_x, num_y) };
     debug!("logup:temp_sums_buffer_capacity={temp_sums_buffer_capacity}");
-    let mut temp_sums_buffer = DeviceBuffer::<Frac<EF>>::with_capacity(temp_sums_buffer_capacity);
-    let mut output = DeviceBuffer::<Frac<EF>>::with_capacity(num_x as usize);
+    let mut temp_sums_buffer =
+        DeviceBuffer::<Frac<FK::ValExt>>::with_capacity(temp_sums_buffer_capacity);
+    let mut output = DeviceBuffer::<Frac<FK::ValExt>>::with_capacity(num_x as usize);
 
+    // TODO: FK::logup_eval_mle — add this method to FieldKernels trait
     unsafe {
-        logup_eval_mle(
+        FK::logup_eval_mle(
             &mut temp_sums_buffer,
             &mut output,
             eq_xi_ptr,

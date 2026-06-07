@@ -11,16 +11,12 @@ use tracing::instrument;
 
 use crate::{
     base::{DeviceMatrix, DeviceMatrixView},
-    cuda::{
-        batch_ntt_small::batch_ntt_small,
-        matrix::{batch_expand_pad, batch_expand_pad_wide},
-        ntt::bit_rev,
-    },
+    cuda::matrix::{batch_expand_pad_any, batch_expand_pad_wide_any},
     hash_scheme::GpuMerkleHash,
     merkle_tree::{MerkleTreeConstructor, MerkleTreeGpu},
-    ntt::batch_ntt,
+    ntt_field::GpuNttField,
     poly::{mle_interpolate_stages, PleMatrix},
-    prelude::F,
+    prelude::F,  // still needed for mle_interpolate_stages placeholder
     GpuProverConfig, ProverError, RsCodeMatrixError, StackTracesError,
 };
 
@@ -45,14 +41,14 @@ pub struct StackedPcsDataGpu<F, Digest> {
 
 #[allow(clippy::type_complexity)]
 #[instrument(level = "info", skip_all)]
-pub fn stacked_commit<MH: GpuMerkleHash + MerkleTreeConstructor>(
+pub fn stacked_commit<Val: GpuNttField, MH: GpuMerkleHash<BaseField = Val> + MerkleTreeConstructor>(
     l_skip: usize,
     n_stack: usize,
     log_blowup: usize,
     k_whir: usize,
-    traces: &[&DeviceMatrix<F>],
+    traces: &[&DeviceMatrix<Val>],
     prover_config: GpuProverConfig,
-) -> Result<(MH::Digest, StackedPcsDataGpu<F, MH::Digest>), ProverError> {
+) -> Result<(MH::Digest, StackedPcsDataGpu<Val, MH::Digest>), ProverError> {
     let mut mem = MemTracker::start("prover.stacked_commit");
     mem.tracing_info("before stacked_commit");
     mem.reset_peak();
@@ -68,7 +64,7 @@ pub fn stacked_commit<MH: GpuMerkleHash + MerkleTreeConstructor>(
         None
     };
     let rs_matrix = rs_code_matrix(log_blowup, &layout, traces, &opt_stacked_matrix)?;
-    let tree = MerkleTreeGpu::<F, MH::Digest>::new_with_hash::<MH>(
+    let tree = MerkleTreeGpu::<Val, MH::Digest>::new_with_hash::<MH>(
         rs_matrix,
         1 << k_whir,
         prover_config.cache_rs_code_matrix,
@@ -85,22 +81,22 @@ pub fn stacked_commit<MH: GpuMerkleHash + MerkleTreeConstructor>(
 
 /// The `traces` **must** already be in height-sorted order.
 ///
-/// This function is generic in `F` and only relies on CUDA memory operations.
+/// This function is generic over any field `Val` and only relies on CUDA memory operations.
 #[instrument(skip_all)]
-pub fn stacked_matrix(
+pub fn stacked_matrix<Val: GpuNttField>(
     l_skip: usize,
     n_stack: usize,
-    traces: &[&DeviceMatrix<F>],
-) -> Result<(PleMatrix<F>, StackedLayout), ProverError> {
+    traces: &[&DeviceMatrix<Val>],
+) -> Result<(PleMatrix<Val>, StackedLayout), ProverError> {
     let layout = get_stacked_layout(l_skip, n_stack, traces);
     let matrix = stack_traces(&layout, traces)?;
     Ok((matrix, layout))
 }
 
-pub(crate) fn get_stacked_layout(
+pub(crate) fn get_stacked_layout<Val: Copy>(
     l_skip: usize,
     n_stack: usize,
-    traces: &[&DeviceMatrix<F>],
+    traces: &[&DeviceMatrix<Val>],
 ) -> StackedLayout {
     let sorted_meta = traces
         .iter()
@@ -114,15 +110,15 @@ pub(crate) fn get_stacked_layout(
     StackedLayout::new(l_skip, l_skip + n_stack, sorted_meta).unwrap()
 }
 
-pub(crate) fn stack_traces(
+pub(crate) fn stack_traces<Val: GpuNttField>(
     layout: &StackedLayout,
-    traces: &[&DeviceMatrix<F>],
-) -> Result<PleMatrix<F>, StackTracesError> {
+    traces: &[&DeviceMatrix<Val>],
+) -> Result<PleMatrix<Val>, StackTracesError> {
     let mem = MemTracker::start("prover.stack_traces");
     let l_skip = layout.l_skip();
     let height = layout.height();
     let width = layout.width();
-    let mut q_evals = DeviceBuffer::<F>::with_capacity(width.checked_mul(height).unwrap());
+    let mut q_evals = DeviceBuffer::<Val>::with_capacity(width.checked_mul(height).unwrap());
     stack_traces_into_expanded(layout, traces, &mut q_evals, height)?;
     mem.emit_metrics();
     Ok(PleMatrix::from_evals(l_skip, q_evals, height, width))
@@ -131,10 +127,10 @@ pub(crate) fn stack_traces(
 /// `buffer` should be the buffer to write the stacked traces into.
 /// `buffer` should be a matrix with dimensions `padded_height x width` where `width` is the stacked
 /// width and `padded_height` must be a multiple of the stacked height.
-pub(crate) fn stack_traces_into_expanded(
+pub(crate) fn stack_traces_into_expanded<Val: Copy>(
     layout: &StackedLayout,
-    traces: &[&DeviceMatrix<F>],
-    buffer: &mut DeviceBuffer<F>,
+    traces: &[&DeviceMatrix<Val>],
+    buffer: &mut DeviceBuffer<Val>,
     padded_height: usize,
 ) -> Result<(), StackTracesError> {
     let l_skip = layout.l_skip();
@@ -159,7 +155,7 @@ pub(crate) fn stack_traces_into_expanded(
                 cuda_memcpy::<true, true>(
                     dst as *mut c_void,
                     src as *const c_void,
-                    s_len * size_of::<F>(),
+                    s_len * size_of::<Val>(),
                 )?;
             }
         } else {
@@ -172,7 +168,7 @@ pub(crate) fn stack_traces_into_expanded(
             unsafe {
                 let src = trace.buffer().as_ptr().add(*j * trace.height());
                 let dst = buffer.as_mut_ptr().add(start);
-                batch_expand_pad_wide(dst, src, trace.height() as u32, stride as u32, 1)
+                batch_expand_pad_wide_any(dst, src, trace.height() as u32, stride as u32, 1)
                     .map_err(StackTracesError::BatchExpandPadWide)?;
             }
         }
@@ -187,26 +183,26 @@ pub(crate) fn stack_traces_into_expanded(
 /// Uses `stacked_matrix` if available, or else stacks `traces` directly into final codeword matrix
 /// buffer.
 #[instrument(skip_all)]
-pub fn rs_code_matrix(
+pub fn rs_code_matrix<Val: GpuNttField>(
     log_blowup: usize,
     layout: &StackedLayout,
-    traces: &[&DeviceMatrix<F>],
-    stacked_matrix: &Option<PleMatrix<F>>,
-) -> Result<DeviceMatrix<F>, RsCodeMatrixError> {
+    traces: &[&DeviceMatrix<Val>],
+    stacked_matrix: &Option<PleMatrix<Val>>,
+) -> Result<DeviceMatrix<Val>, RsCodeMatrixError> {
     let mem = MemTracker::start_and_reset_peak("prover.rs_code_matrix");
     let l_skip = layout.l_skip();
     let height = layout.height();
     let width = layout.width();
     debug_assert!(height >= (1 << l_skip));
     let codeword_height = height.checked_shl(log_blowup as u32).unwrap();
-    let mut codewords = DeviceBuffer::<F>::with_capacity(codeword_height * width);
+    let mut codewords = DeviceBuffer::<Val>::with_capacity(codeword_height * width);
     // The following kernels together perform MLE interpolation followed by coset NTT for
     // `width` polys from `height -> codeword_height` size domains.
     if let Some(stacked_matrix) = stacked_matrix.as_ref() {
         // SAFETY: `codewords` is allocated for `width` polys of `codeword_height` each, and we
         // expand from `matrix.mixed` which is `width` polys of `height` each.
         unsafe {
-            batch_expand_pad(
+            batch_expand_pad_any(
                 codewords.as_mut_ptr(),
                 stacked_matrix.mixed.as_ptr(),
                 width as u32,
@@ -227,7 +223,7 @@ pub fn rs_code_matrix(
             // (width cols) * (codeword_height / 2^l_skip chunks per col). Use natural ordering.
             let num_uni_poly = width * (codeword_height >> l_skip);
             unsafe {
-                batch_ntt_small(&mut codewords, l_skip, num_uni_poly, true)
+                Val::batch_ntt_small(&mut codewords, l_skip, num_uni_poly, true)
                     .map_err(RsCodeMatrixError::CustomBatchIntt)?;
             }
         }
@@ -242,37 +238,60 @@ pub fn rs_code_matrix(
     // After iNTT, each chunk holds Z-monomial coefficients. We apply the subset-zeta
     // transform to convert to hypercube evaluations over the Z-bit variables.
     if l_skip > 0 {
-        // SAFETY: `codewords` is properly initialized and parameters are valid.
-        // Steps 2^0, 2^1, ..., 2^(l_skip-1) stay within chunk boundaries.
-        unsafe {
-            mle_interpolate_stages(
-                codewords.as_mut_ptr(),
-                width,
-                codeword_height as u32,
-                log_blowup as u32,
-                0,                 // start_log_step
-                l_skip as u32 - 1, // end_log_step (inclusive)
-                false,             // coeffs to evals (NOT eval to coeff)
-                false,             // natural order
-            )
-            .map_err(|error| RsCodeMatrixError::MleInterpolateStage2d { error, step: 1 })?;
+        if Val::use_cpu_gkr() {
+            // CPU fallback for KB: mle_interpolate_stages uses BB kernels, wrong for KB.
+            // Apply butterfly stages 0..l_skip-1 on CPU within each 2^l_skip chunk per column.
+            use openvm_cuda_common::copy::{MemCopyD2H, MemCopyH2D};
+            let mut host = codewords.to_host().map_err(|_| RsCodeMatrixError::MleInterpolateStage2d {
+                error: openvm_cuda_common::error::CudaError::new(1), step: 1 })?;
+            for col in 0..width {
+                let col_base = col * codeword_height;
+                for stage in 0..l_skip {
+                    let step = 1usize << stage;
+                    // Apply butterfly within each 2^l_skip chunk in the meaningful rows [0..height)
+                    let mut chunk_base = 0;
+                    while chunk_base < height {
+                        for j in 0..step {
+                            let u = host[col_base + chunk_base + j];
+                            host[col_base + chunk_base + step + j] += u;
+                        }
+                        chunk_base += 2 * step;
+                    }
+                }
+            }
+            host.copy_to(&mut codewords).map_err(|_| RsCodeMatrixError::MleInterpolateStage2d {
+                error: openvm_cuda_common::error::CudaError::new(1), step: 1 })?;
+        } else {
+            // SAFETY: `codewords` is properly initialized and parameters are valid.
+            // Steps 2^0, 2^1, ..., 2^(l_skip-1) stay within chunk boundaries.
+            unsafe {
+                mle_interpolate_stages(
+                    codewords.as_mut_ptr() as *mut F,
+                    width,
+                    codeword_height as u32,
+                    log_blowup as u32,
+                    0,                 // start_log_step
+                    l_skip as u32 - 1, // end_log_step (inclusive)
+                    false,             // coeffs to evals (NOT eval to coeff)
+                    false,             // natural order
+                )
+                .map_err(|error| RsCodeMatrixError::MleInterpolateStage2d { error, step: 1 })?;
+            }
         }
     }
 
     // Bit-reverse the entire buffer in-place (required for NTT)
-    unsafe {
-        bit_rev(
-            &codewords,
-            &codewords,
-            log_codeword_height as u32,
-            codeword_height as u32,
-            width as u32,
-        )
-        .map_err(RsCodeMatrixError::BitRev)?;
-    }
+    Val::bit_rev(
+        &codewords,
+        &codewords,
+        log_codeword_height as u32,
+        codeword_height as u32,
+        width as u32,
+    )
+    .map_err(RsCodeMatrixError::BitRev)?;
 
     // Compute RS codeword via DFT on the smoothly-embedded domain.
-    batch_ntt(
+    Val::batch_ntt(
         &codewords,
         log_codeword_height as u32,
         0u32,
@@ -287,6 +306,12 @@ pub fn rs_code_matrix(
 }
 
 impl<F, Digest> StackedPcsDataGpu<F, Digest> {
+    /// Construct a StackedPcsDataGpu from a pre-built Merkle tree without a cached matrix.
+    /// Used when transporting CPU-committed PCS data to GPU format.
+    pub fn from_tree(layout: StackedLayout, tree: MerkleTreeGpu<F, Digest>) -> Self {
+        Self { layout, matrix: None, tree }
+    }
+
     /// Returns a view of the specified unstacked matrix in mixed form.
     ///
     /// # Notes

@@ -40,6 +40,13 @@ extern "C" {
     fn _generate_device_ntt_twiddles(d_twiddles: *mut c_void) -> i32;
 }
 
+#[cfg(feature = "koala-bear-poseidon2")]
+extern "C" {
+    // KoalaBear has its OWN DEVICE_NTT_TWIDDLES constant array (batch_ntt_small.cu is compiled
+    // into the cuda_kb_all library too). It must be initialized separately from the BabyBear one.
+    fn _kb_generate_device_ntt_twiddles(d_twiddles: *mut c_void) -> i32;
+}
+
 static INIT_DEVICE_NTT_TWIDDLES: OnceLock<Mutex<BTreeSet<(i32, u64)>>> = OnceLock::new();
 
 /// Ensure device NTT twiddles are initialized in constant memory.
@@ -60,6 +67,18 @@ pub fn ensure_device_ntt_twiddles_initialized() -> Result<(), CudaError> {
         let twiddles = DeviceBuffer::<F>::with_capacity(DEVICE_NTT_TWIDDLES_SIZE);
         unsafe {
             generate_device_ntt_twiddles(&twiddles)?;
+        }
+        // KoalaBear's DEVICE_NTT_TWIDDLES is a distinct constant array in the cuda_kb_all
+        // library and must be initialized too — otherwise it stays zero and get_twiddle()
+        // returns 0, collapsing the round0 zerocheck/logup small-NTT evals for l_skip>0.
+        #[cfg(feature = "koala-bear-poseidon2")]
+        {
+            let kb_twiddles = DeviceBuffer::<F>::with_capacity(DEVICE_NTT_TWIDDLES_SIZE);
+            unsafe {
+                CudaError::from_result(_kb_generate_device_ntt_twiddles(
+                    kb_twiddles.as_mut_raw_ptr(),
+                ))?;
+            }
         }
     }
     initialized.insert(device_key);

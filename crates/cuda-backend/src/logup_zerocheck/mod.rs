@@ -11,6 +11,7 @@ use std::{
     cmp::max,
     collections::hash_map::Entry,
     iter::{self, zip},
+    marker::PhantomData,
     sync::Arc,
 };
 
@@ -28,13 +29,13 @@ use openvm_stark_backend::{
     p3_matrix::dense::RowMajorMatrix,
     poly_common::{
         eq_uni_poly, eval_eq_mle, eval_eq_sharp_uni, eval_eq_uni, eval_eq_uni_at_one,
-        UnivariatePoly,
+        evals_eq_hypercube_serial, UnivariatePoly,
     },
     proof::{column_openings_by_rot, BatchConstraintProof, GkrProof},
     prover::{
         fractional_sumcheck_gkr::Frac, poly::eq_sharp_uni_poly, stacked_pcs::StackedLayout,
         sumcheck::sumcheck_round0_deg, ColMajorMatrix, DeviceMultiStarkProvingKey,
-        MatrixDimensions, ProvingContext,
+        EvalHelper, MatrixDimensions, ProvingContext,
     },
 };
 use p3_dft::TwoAdicSubgroupDft;
@@ -45,20 +46,19 @@ use tracing::{debug, info, info_span, instrument};
 
 use crate::{
     base::DeviceMatrix,
-    cuda::{
-        logup_zerocheck::{fold_selectors_round0, interpolate_columns_gpu, MainMatrixPtrs},
-        sumcheck::batch_fold_mle,
-    },
+    cuda::{field_kernels::FieldKernels, logup_zerocheck::MainMatrixPtrs},
     data_transporter::transport_matrix_d2h_col_major,
     error::LogupZerocheckError,
     gpu_backend::GenericGpuBackend,
     hash_scheme::GpuHashScheme,
     logup_zerocheck::{
         batch_mle::evaluate_zerocheck_batched, fold_ple::fold_ple_evals_rotate,
-        gkr_input::TraceInteractionMeta, round0::evaluate_round0_interactions_gpu,
+        gkr_input::TraceInteractionMeta,
+        round0::{
+            evaluate_round0_interactions_cpu_fallback, evaluate_round0_interactions_gpu,
+        },
     },
     poly::EqEvalLayers,
-    prelude::{EF, F},
     sponge::GpuFiatShamirTranscript,
     utils::compute_barycentric_inv_lagrange_denoms,
 };
@@ -102,18 +102,36 @@ pub(crate) fn air_width_for_mat(need_rot: bool, mat_width: usize) -> u32 {
     }
 }
 
+/// Debug bisection helper: returns true if a given zerocheck/logup-mle site should be FORCED
+/// onto the GPU path (overriding `use_cpu_zerocheck_mle()==true`). Controlled by env
+/// `SWIRL_GPU_ZC` = comma-separated site names, e.g. `mle`, `fold`, `zc_r0`, `logup_r0`,
+/// `treebuild`, or `all`. Used to isolate which GPU zerocheck/logup path is buggy.
+pub(crate) fn force_gpu_zc_site(name: &str) -> bool {
+    std::env::var("SWIRL_GPU_ZC")
+        .map(|v| v.split(',').any(|s| s.trim() == name || s.trim() == "all"))
+        .unwrap_or(false)
+}
+
 #[allow(clippy::type_complexity)]
 #[instrument(level = "info", skip_all)]
-pub fn prove_zerocheck_and_logup_gpu<HS, TS>(
+pub fn prove_zerocheck_and_logup_gpu<FK, HS, TS>(
     transcript: &mut TS,
     mpk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
     ctx: &ProvingContext<GenericGpuBackend<HS>>,
     save_memory: bool,
     monomial_num_y_threshold: u32,
     sm_count: u32,
-) -> Result<(GkrProof<HS::SC>, BatchConstraintProof<HS::SC>, Vec<EF>), LogupZerocheckError>
+) -> Result<
+    (
+        GkrProof<HS::SC>,
+        BatchConstraintProof<HS::SC>,
+        Vec<FK::ValExt>,
+    ),
+    LogupZerocheckError,
+>
 where
-    HS: GpuHashScheme,
+    FK: FieldKernels,
+    HS: GpuHashScheme<BaseField = FK::Val, ExtField = FK::ValExt>,
     TS: GpuFiatShamirTranscript<HS::SC>,
 {
     let logup_gkr_span = info_span!("prover.rap_constraints.logup_gkr", phase = "prover").entered();
@@ -155,7 +173,7 @@ where
     debug!(%alpha_logup, %beta_logup);
 
     let has_interactions = !interactions_layout.sorted_cols.is_empty();
-    let mut prover = LogupZerocheckGpu::new(
+    let mut prover = LogupZerocheckGpu::<FK, HS>::new(
         mpk,
         ctx,
         n_logup,
@@ -174,7 +192,7 @@ where
         .emit_metrics_with_label("prover.before_gkr_input_evals");
     prover.mem.reset_peak();
     let (inputs, alpha) = if has_interactions {
-        log_gkr_input_evals(
+        log_gkr_input_evals::<FK, HS>(
             &prover.trace_interactions,
             mpk,
             ctx,
@@ -184,10 +202,10 @@ where
             total_leaves,
         )?
     } else {
-        (DeviceBuffer::new(), EF::ZERO)
+        (DeviceBuffer::new(), FK::ValExt::ZERO)
     };
     // Set memory limit for batch MLE based on inputs buffer size
-    prover.gkr_mem_contribution = inputs.len() * std::mem::size_of::<Frac<EF>>();
+    prover.gkr_mem_contribution = inputs.len() * std::mem::size_of::<Frac<FK::ValExt>>();
     prover.memory_limit_bytes = prover.gkr_mem_contribution;
     if !prover.save_memory {
         const DEFAULT_MEMORY_LIMIT: usize = 5 << 30; // 5GiB
@@ -202,7 +220,7 @@ where
     prover.mem.emit_metrics_with_label("prover.gkr_input_evals");
 
     let (frac_sum_proof, mut xi) =
-        fractional_sumcheck_gpu(transcript, inputs, alpha, true, &mut prover.mem)?;
+        fractional_sumcheck_gpu::<FK, HS::SC, _>(transcript, inputs, alpha, true, &mut prover.mem)?;
     while xi.len() != l_skip + n_global {
         xi.push(transcript.sample_ext());
     }
@@ -231,11 +249,11 @@ where
     let s_0_logup_polys = {
         let eq_sharp_uni = eq_sharp_uni_poly(&prover.xi[..l_skip]);
         let mut eq_coeffs = eq_sharp_uni.into_coeffs();
-        eq_coeffs.resize(large_uni_domain, EF::ZERO);
+        eq_coeffs.resize(large_uni_domain, FK::ValExt::ZERO);
         let eq_evals = dft.dft(eq_coeffs);
 
         let width = 2 * num_traces;
-        let mut sp_coeffs_mat = EF::zero_vec(width * large_uni_domain);
+        let mut sp_coeffs_mat = FK::ValExt::zero_vec(width * large_uni_domain);
         for (i, coeffs) in sp_0_polys[..2 * num_traces].iter().enumerate() {
             for (j, &c_j) in coeffs.coeffs().iter().enumerate().take(sp_0_deg + 1) {
                 // SAFETY:
@@ -254,7 +272,7 @@ where
         }
         dft.idft_batch(s_evals)
     };
-    let skip_domain_size = F::from_usize(1 << l_skip);
+    let skip_domain_size = FK::Val::from_usize(1 << l_skip);
     // logup sum claims (sum_{\hat p}, sum_{\hat q}) per present AIR
     let (numerator_term_per_air, denominator_term_per_air): (Vec<_>, Vec<_>) = (0..num_traces)
         .map(|trace_idx| {
@@ -269,7 +287,7 @@ where
                             .values
                             .get_unchecked(j * 2 * num_traces + 2 * trace_idx + is_denom)
                     })
-                    .sum::<EF>()
+                    .sum::<FK::ValExt>()
                     * skip_domain_size
             });
             transcript.observe_ext(sum_claim_p);
@@ -284,18 +302,18 @@ where
     let mu_pows = mu.powers().take(3 * num_traces).collect_vec();
 
     let s_0_zc_poly = {
-        let eq_uni = eq_uni_poly::<F, _>(l_skip, prover.xi[0]);
+        let eq_uni = eq_uni_poly::<FK::Val, _>(l_skip, prover.xi[0]);
         let mut eq_coeffs = eq_uni.into_coeffs();
-        eq_coeffs.resize(large_uni_domain, EF::ZERO);
+        eq_coeffs.resize(large_uni_domain, FK::ValExt::ZERO);
         let eq_evals = dft.dft(eq_coeffs);
 
         // Algebraically batch
-        let mut sp_coeffs = EF::zero_vec(large_uni_domain);
+        let mut sp_coeffs = FK::ValExt::zero_vec(large_uni_domain);
         let mus = &mu_pows[2 * num_traces..];
         let polys = &sp_0_polys[2 * num_traces..];
         for (j, batch_coeff) in sp_coeffs.iter_mut().enumerate().take(sp_0_deg + 1) {
             for (&mu, poly) in zip(mus, polys) {
-                *batch_coeff += mu * *poly.coeffs().get(j).unwrap_or(&EF::ZERO);
+                *batch_coeff += mu * *poly.coeffs().get(j).unwrap_or(&FK::ValExt::ZERO);
             }
         }
         let mut s_evals = dft.dft(sp_coeffs);
@@ -316,7 +334,7 @@ where
             let coeff = batched_zc
                 + zip(&mu_pows, logup_row)
                     .map(|(&mu_j, &x)| mu_j * x)
-                    .sum::<EF>();
+                    .sum::<FK::ValExt>();
             transcript.observe_ext(coeff);
             coeff
         })
@@ -336,7 +354,7 @@ where
     // Sumcheck rounds:
     // - each round the prover needs to compute univariate polynomial `s_round`. This poly is linear
     //   since we are taking MLE of `evals`.
-    // - at end of each round, sample random `r_round` in `EF`
+    // - at end of each round, sample random `r_round` in `FK::ValExt`
     //
     // `s_round` is degree `s_deg` so we evaluate it at `0, ..., =s_deg`. The prover skips
     // evaluation at `0` because the verifier can infer it from the previous round's
@@ -348,7 +366,7 @@ where
         let sp_round_evals = prover.sumcheck_polys_batch_eval(round, r[round - 1])?;
         let batch_s = prover.compute_batch_s_poly(sp_round_evals, num_traces, round, &mu_pows);
         let batch_s_evals = (1..=s_deg)
-            .map(|i| batch_s.eval_at_point(EF::from_usize(i)))
+            .map(|i| batch_s.eval_at_point(FK::ValExt::from_usize(i)))
             .collect_vec();
         for &eval in &batch_s_evals {
             transcript.observe_ext(eval);
@@ -404,19 +422,19 @@ where
     Ok((gkr_proof, batch_constraint_proof, r))
 }
 
-pub struct LogupZerocheckGpu<'a, HS: GpuHashScheme> {
-    pub alpha_logup: EF,
-    pub beta_pows: Vec<EF>,
+pub struct LogupZerocheckGpu<'a, FK: FieldKernels, HS: GpuHashScheme> {
+    pub alpha_logup: FK::ValExt,
+    pub beta_pows: Vec<FK::ValExt>,
     // [alpha, beta^0, beta^1, .., beta^max_interaction_len]
-    pub d_challenges: DeviceBuffer<EF>,
+    pub d_challenges: DeviceBuffer<FK::ValExt>,
 
     pub l_skip: usize,
     n_logup: usize,
     n_global: usize,
 
-    pub omega_skip: F,
-    pub omega_skip_pows: Vec<F>,
-    d_omega_skip_pows: DeviceBuffer<F>,
+    pub omega_skip: FK::Val,
+    pub omega_skip_pows: Vec<FK::Val>,
+    d_omega_skip_pows: DeviceBuffer<FK::Val>,
 
     pub interactions_layout: StackedLayout,
     pub constraint_degree: usize,
@@ -425,39 +443,38 @@ pub struct LogupZerocheckGpu<'a, HS: GpuHashScheme> {
     pub monomial_num_y_threshold: u32,
     sm_count: u32,
     // Available after GKR:
-    pub xi: Vec<EF>,
-    pub lambda_pows: Option<DeviceBuffer<EF>>,
+    pub xi: Vec<FK::ValExt>,
+    pub lambda_pows: Option<DeviceBuffer<FK::ValExt>>,
     /// Precomputed lambda combinations per AIR (indexed by air_idx). Set when lambda is sampled.
-    lambda_combinations: Vec<Option<DeviceBuffer<EF>>>,
+    lambda_combinations: Vec<Option<DeviceBuffer<FK::ValExt>>>,
     /// Beta powers on device for logup MLE rounds.
-    d_beta_pows: DeviceBuffer<EF>,
+    d_beta_pows: DeviceBuffer<FK::ValExt>,
     /// Precomputed logup combinations per trace (indexed by trace_idx). Set when xi is sampled.
-    logup_combinations: Vec<Option<LogupCombinations>>,
+    logup_combinations: Vec<Option<LogupCombinations<FK>>>,
 
     // n_T => segment tree of eq(xi[j..1+n_T]) for j=1..={n_T-round+1} in _reverse_ layout
-    eq_xis: FxHashMap<usize, EqEvalLayers<EF>>,
-    eq_3b_per_trace: Vec<Vec<EF>>,
-    d_eq_3b_per_trace: Vec<DeviceBuffer<EF>>,
+    eq_xis: FxHashMap<usize, EqEvalLayers<FK::ValExt>>,
+    eq_3b_per_trace: Vec<Vec<FK::ValExt>>,
+    d_eq_3b_per_trace: Vec<DeviceBuffer<FK::ValExt>>,
     // Evaluations on hypercube only, for round 0
-    sels_per_trace_base: Vec<DeviceMatrix<F>>,
+    sels_per_trace_base: Vec<DeviceMatrix<FK::Val>>,
     // After univariate round 0:
-    mat_evals_per_trace: Vec<Vec<DeviceMatrix<EF>>>,
-    sels_per_trace: Vec<DeviceMatrix<EF>>,
+    mat_evals_per_trace: Vec<Vec<DeviceMatrix<FK::ValExt>>>,
+    sels_per_trace: Vec<DeviceMatrix<FK::ValExt>>,
     // Store public_values per trace (similar to CPU's EvalHelper)
-    public_values_per_trace: Vec<DeviceBuffer<F>>,
+    public_values_per_trace: Vec<DeviceBuffer<FK::Val>>,
     air_indices_per_trace: Vec<usize>,
-    zerocheck_tilde_evals: Vec<EF>,
-    logup_tilde_evals: Vec<[EF; 2]>,
+    zerocheck_tilde_evals: Vec<FK::ValExt>,
+    logup_tilde_evals: Vec<[FK::ValExt; 2]>,
     needs_next_per_trace: Vec<bool>,
 
     trace_interactions: Vec<Option<TraceInteractionMeta>>,
-    // round0: Round0Buffers,
     pk: &'a DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
 
     // In round `j`, contains `s_{j-1}(r_{j-1})`
-    pub(crate) prev_s_eval: EF,
-    pub(crate) eq_ns: Vec<EF>,
-    pub(crate) eq_sharp_ns: Vec<EF>,
+    pub(crate) prev_s_eval: FK::ValExt,
+    pub(crate) eq_ns: Vec<FK::ValExt>,
+    pub(crate) eq_sharp_ns: Vec<FK::ValExt>,
 
     mem: MemTracker,
     save_memory: bool,
@@ -465,24 +482,28 @@ pub struct LogupZerocheckGpu<'a, HS: GpuHashScheme> {
     gkr_mem_contribution: usize,
     /// Memory limit for batch MLE intermediate buffers (set after GKR input eval)
     memory_limit_bytes: usize,
+
+    _phantom: PhantomData<FK>,
 }
 
-impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
+impl<'a, FK: FieldKernels, HS: GpuHashScheme<BaseField = FK::Val, ExtField = FK::ValExt>>
+    LogupZerocheckGpu<'a, FK, HS>
+{
     #[allow(clippy::too_many_arguments)]
     fn new(
         pk: &'a DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
         ctx: &ProvingContext<GenericGpuBackend<HS>>,
         n_logup: usize,
         interactions_layout: StackedLayout,
-        alpha_logup: EF,
-        beta_logup: EF,
+        alpha_logup: FK::ValExt,
+        beta_logup: FK::ValExt,
         save_memory: bool,
         monomial_num_y_threshold: u32,
         sm_count: u32,
     ) -> Result<Self, LogupZerocheckError> {
         let mem = MemTracker::start("prover.logup_zerocheck_prover");
         let l_skip = pk.params.l_skip;
-        let omega_skip = F::two_adic_generator(l_skip);
+        let omega_skip = FK::Val::two_adic_generator(l_skip);
         let omega_skip_pows = omega_skip.powers().take(1 << l_skip).collect_vec();
         let d_omega_skip_pows = omega_skip_pows.to_device()?;
         let num_airs_present = ctx.per_trace.len();
@@ -526,7 +547,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             .unwrap_or(0);
 
         // Collect interaction metadata for GPU execution (evaluations still run on CPU for now).
-        let trace_interactions = collect_trace_interactions(pk, ctx, &interactions_layout);
+        let trace_interactions = collect_trace_interactions::<FK, HS>(pk, ctx, &interactions_layout);
 
         let needs_next_per_trace = ctx
             .per_trace
@@ -576,12 +597,12 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                 .iter()
                 .map(|(air_idx, _)| *air_idx)
                 .collect_vec(),
-            zerocheck_tilde_evals: vec![EF::ZERO; num_airs_present],
-            logup_tilde_evals: vec![[EF::ZERO; 2]; num_airs_present],
+            zerocheck_tilde_evals: vec![FK::ValExt::ZERO; num_airs_present],
+            logup_tilde_evals: vec![[FK::ValExt::ZERO; 2]; num_airs_present],
             needs_next_per_trace,
             trace_interactions,
             pk,
-            prev_s_eval: EF::ZERO,
+            prev_s_eval: FK::ValExt::ZERO,
             eq_ns: Vec::with_capacity(n_max + 1),
             eq_sharp_ns: Vec::with_capacity(n_max + 1),
             mem,
@@ -589,6 +610,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             gkr_mem_contribution: 0,
             memory_limit_bytes: 0, // Set after GKR input eval
             monomial_num_y_threshold,
+            _phantom: PhantomData,
         })
     }
 
@@ -598,8 +620,8 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
     fn sumcheck_uni_round0_polys(
         &mut self,
         ctx: &ProvingContext<GenericGpuBackend<HS>>,
-        lambda: EF,
-    ) -> Result<Vec<UnivariatePoly<EF>>, LogupZerocheckError> {
+        lambda: FK::ValExt,
+    ) -> Result<Vec<UnivariatePoly<FK::ValExt>>, LogupZerocheckError> {
         self.mem
             .emit_metrics_with_label("prover.batch_constraints.before_round0");
         self.mem.reset_peak();
@@ -617,7 +639,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         for (air_idx, air_pk) in self.pk.per_air.iter().enumerate() {
             if air_pk.other_data.zerocheck_monomials.is_some() {
                 self.lambda_combinations[air_idx] = Some(
-                    compute_lambda_combinations(self.pk, air_idx, lambda_pows_ref)
+                    compute_lambda_combinations::<FK, HS>(self.pk, air_idx, lambda_pows_ref)
                         .map_err(LogupZerocheckError::LambdaCombinations)?,
                 );
             }
@@ -635,7 +657,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                 if num_interactions > 0 {
                     let n = self.n_per_trace[trace_idx];
                     let n_lift = n.max(0) as usize;
-                    let mut b_vec = vec![F::ZERO; n_logup - n_lift];
+                    let mut b_vec = vec![FK::Val::ZERO; n_logup - n_lift];
                     let mut weights = Vec::with_capacity(num_interactions);
                     for interaction_idx in 0..num_interactions {
                         let stacked_idx = self
@@ -645,7 +667,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                             .row_idx;
                         let mut b_int = stacked_idx >> (l_skip + n_lift);
                         for bit in &mut b_vec {
-                            *bit = F::from_bool(b_int & 1 == 1);
+                            *bit = FK::Val::from_bool(b_int & 1 == 1);
                             b_int >>= 1;
                         }
                         let weight =
@@ -696,7 +718,10 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             let n_lift = n.max(0) as usize;
             if let Entry::Vacant(entry) = self.eq_xis.entry(n_lift) {
                 let layers =
-                    EqEvalLayers::new_rev(n_lift, xi[l_skip..l_skip + n_lift].iter().rev())
+                    EqEvalLayers::new_rev_with_kernels::<FK>(
+                        n_lift,
+                        xi[l_skip..l_skip + n_lift].iter().rev(),
+                    )
                         .map_err(LogupZerocheckError::EqEvalLayers)?;
                 entry.insert(layers);
             }
@@ -708,10 +733,10 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             .map(|&n| {
                 let n_lift = n.max(0) as usize;
                 let height = 1 << n_lift;
-                let mut cols = F::zero_vec(3 * height);
-                cols[height..2 * height - 1].fill(F::ONE); // is_transition
-                cols[0] = F::ONE; // is_first
-                cols[2 * height + height - 1] = F::ONE; // is_last
+                let mut cols = FK::Val::zero_vec(3 * height);
+                cols[height..2 * height - 1].fill(FK::Val::ONE); // is_transition
+                cols[0] = FK::Val::ONE; // is_first
+                cols[2 * height + height - 1] = FK::Val::ONE; // is_last
                 let d_cols = cols.to_device()?;
                 Ok(DeviceMatrix::new(Arc::new(d_cols), height, 3))
             })
@@ -755,7 +780,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             );
 
             let log_large_domain = log2_ceil_usize(local_constraint_deg << l_skip);
-            let omega_root = F::two_adic_generator(log_large_domain);
+            let omega_root = FK::Val::two_adic_generator(log_large_domain);
 
             assert!(!xi.is_empty(), "xi vector must not be empty");
 
@@ -774,108 +799,217 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             // on trace polynomials could vanish on 2^l_skip points is if the constraint polynomial
             // is identically zero. Thus for local_constraint_deg = 0 or 1, we must have `s'_0 = 0`.
             let num_cosets_zc = local_constraint_deg.saturating_sub(1);
-            let sum_buffer = evaluate_round0_constraints_gpu(
-                single_pk,
-                selectors_cube.buffer(),
-                &d_main_parts,
-                public_values,
-                eq_xi_tree.get_ptr(n_lift),
-                d_lambda_pows,
-                1 << l_skip,
-                1 << n_lift,
-                height as u32,
-                num_cosets_zc as u32,
-                omega_root,
-                max_temp_bytes,
-            )?;
-            if !sum_buffer.is_empty() {
-                let q_evals = sum_buffer.to_host()?;
-                let q = {
-                    // Make q_evals row-major, with columns <> cosets
-                    let mut values = EF::zero_vec(num_cosets_zc << l_skip);
-                    for coset_idx in 0..num_cosets_zc {
-                        for i in 0..1 << l_skip {
-                            values[i * num_cosets_zc + coset_idx] =
-                                q_evals[(coset_idx << l_skip) + i];
+            let zc_r0_cpu = FK::use_cpu_zerocheck_mle() && !force_gpu_zc_site("zc_r0");
+            let zc_r0_verify = std::env::var("SWIRL_VERIFY_ZC_R0").is_ok();
+
+            // CPU zerocheck round0 sp_0 (computed if used for proof, or for verification).
+            let cpu_zc_sp0: Option<UnivariatePoly<FK::ValExt>> = if zc_r0_cpu || zc_r0_verify {
+                use round0::evaluate_round0_constraints_cpu_fallback;
+                let cached_refs: Vec<&DeviceMatrix<FK::Val>> =
+                    air_ctx.cached_mains.iter().map(|cd| &cd.trace).collect();
+                let lambda_host: Vec<FK::ValExt> = match self.lambda_pows.as_ref() {
+                    Some(d) if !d.is_empty() => d.to_host()?,
+                    _ => vec![],
+                };
+                evaluate_round0_constraints_cpu_fallback::<FK>(
+                    &single_pk.vk.symbolic_constraints.constraints,
+                    &single_air_constraints,
+                    &cached_refs,
+                    &air_ctx.common_main,
+                    &xi[l_skip..l_skip + n_lift],
+                    single_pk.vk.params.need_rot,
+                    &lambda_host,
+                    l_skip,
+                    height,
+                    local_constraint_deg,
+                    &air_ctx.public_values,
+                )?
+            } else {
+                None
+            };
+
+            // GPU zerocheck round0 sp_0.
+            let gpu_zc_sp0: Option<UnivariatePoly<FK::ValExt>> = if !zc_r0_cpu || zc_r0_verify {
+                let sum_buffer = evaluate_round0_constraints_gpu::<FK, HS>(
+                    single_pk,
+                    selectors_cube.buffer(),
+                    &d_main_parts,
+                    public_values,
+                    eq_xi_tree.get_ptr(n_lift),
+                    d_lambda_pows,
+                    1 << l_skip,
+                    1 << n_lift,
+                    height as u32,
+                    num_cosets_zc as u32,
+                    omega_root,
+                    max_temp_bytes,
+                )?;
+                if !sum_buffer.is_empty() {
+                    let q_evals = sum_buffer.to_host()?;
+                    if std::env::var("SWIRL_DUMP_ZCR0").is_ok() {
+                        tracing::warn!(
+                            "ZCR0_DUMP trace={trace_idx} l_skip={l_skip} num_cosets={num_cosets_zc} \
+                             skip_domain={} omega_root={omega_root:?} q_evals={q_evals:?}",
+                            1usize << l_skip
+                        );
+                    }
+                    let q = {
+                        // Make q_evals row-major, with columns <> cosets
+                        let mut values = FK::ValExt::zero_vec(num_cosets_zc << l_skip);
+                        for coset_idx in 0..num_cosets_zc {
+                            for i in 0..1usize << l_skip {
+                                values[i * num_cosets_zc + coset_idx] =
+                                    q_evals[(coset_idx << l_skip) + i];
+                            }
+                        }
+                        UnivariatePoly::from_geometric_cosets_evals_idft(
+                            RowMajorMatrix::new(values, num_cosets_zc),
+                            omega_root,
+                            omega_root,
+                        )
+                    };
+                    // sp_0 = (Z^{2^l_skip} - 1) * q
+                    let sp_0_deg = sumcheck_round0_deg(l_skip, local_constraint_deg);
+                    let coeffs = (0..=sp_0_deg)
+                        .map(|i| {
+                            let mut c = -*q.coeffs().get(i).unwrap_or(&FK::ValExt::ZERO);
+                            if i >= 1 << l_skip {
+                                c += q.coeffs()[i - (1 << l_skip)];
+                            }
+                            c
+                        })
+                        .collect_vec();
+                    Some(UnivariatePoly::new(coeffs))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if zc_r0_verify {
+                match (&cpu_zc_sp0, &gpu_zc_sp0) {
+                    (Some(c), Some(g)) => {
+                        let cc = c.coeffs();
+                        let gc = g.coeffs();
+                        let mut mism = 0usize;
+                        let mut first = None;
+                        for i in 0..cc.len().max(gc.len()) {
+                            let cv = cc.get(i).copied().unwrap_or(FK::ValExt::ZERO);
+                            let gv = gc.get(i).copied().unwrap_or(FK::ValExt::ZERO);
+                            if cv != gv {
+                                mism += 1;
+                                if first.is_none() { first = Some((i, cv, gv)); }
+                            }
+                        }
+                        if mism > 0 {
+                            let (i, cv, gv) = first.unwrap();
+                            tracing::warn!(
+                                "ZC_R0_VERIFY trace={trace_idx} l_skip={l_skip} n_lift={n_lift} \
+                                 deg={local_constraint_deg}: {mism} coeff mismatch (cpu_len={} gpu_len={}); \
+                                 first coeff={i} CPU={cv:?} GPU={gv:?}",
+                                cc.len(), gc.len()
+                            );
+                        } else {
+                            tracing::warn!(
+                                "ZC_R0_VERIFY trace={trace_idx} l_skip={l_skip}: OK ({} coeffs)",
+                                cc.len()
+                            );
                         }
                     }
-                    UnivariatePoly::from_geometric_cosets_evals_idft(
-                        RowMajorMatrix::new(values, num_cosets_zc),
-                        omega_root,
-                        omega_root,
-                    )
-                };
-                // sp_0 = (Z^{2^l_skip} - 1) * q
-                let sp_0_deg = sumcheck_round0_deg(l_skip, local_constraint_deg);
-                let coeffs = (0..=sp_0_deg)
-                    .map(|i| {
-                        let mut c = -*q.coeffs().get(i).unwrap_or(&EF::ZERO);
-                        if i >= 1 << l_skip {
-                            c += q.coeffs()[i - (1 << l_skip)];
-                        }
-                        c
-                    })
-                    .collect_vec();
-                debug_assert_eq!(
-                    coeffs.iter().step_by(1 << l_skip).copied().sum::<EF>(),
-                    EF::ZERO,
-                    "Zerocheck sum is not zero for air_id: {}",
-                    ctx.per_trace[trace_idx].0
-                );
+                    (None, None) => {
+                        tracing::warn!("ZC_R0_VERIFY trace={trace_idx} l_skip={l_skip}: OK (both None)");
+                    }
+                    _ => tracing::warn!(
+                        "ZC_R0_VERIFY trace={trace_idx} l_skip={l_skip}: SHAPE mismatch cpu_some={} gpu_some={}",
+                        cpu_zc_sp0.is_some(), gpu_zc_sp0.is_some()
+                    ),
+                }
+            }
 
-                batch_sp_poly[2 * num_present_airs + trace_idx] = UnivariatePoly::new(coeffs);
+            let chosen_zc_sp0 = if zc_r0_cpu { cpu_zc_sp0 } else { gpu_zc_sp0 };
+            if let Some(sp_0) = chosen_zc_sp0 {
+                batch_sp_poly[2 * num_present_airs + trace_idx] = sp_0;
             }
 
             // PERF: we could use an interaction-specific constraint degree here
             let num_cosets_logup = local_constraint_deg;
-            let sum = evaluate_round0_interactions_gpu(
-                single_pk,
-                &single_air_constraints,
-                selectors_cube.buffer(),
-                &d_main_parts,
-                public_values,
-                eq_xi_tree.get_ptr(n_lift),
-                &self.beta_pows,
-                eq_3bs,
-                1 << l_skip,
-                1 << n_lift,
-                height as u32,
-                num_cosets_logup as u32,
-                omega_root,
-                max_temp_bytes,
-            )?;
-            if !sum.is_empty() {
-                let evals = sum.to_host()?;
-                let (mut numer, denom): (Vec<EF>, Vec<EF>) =
-                    evals.into_iter().map(|frac| (frac.p, frac.q)).unzip();
-                if n.is_negative() {
-                    // normalize for lifting
-                    let norm_factor = F::from_u32(1 << n.unsigned_abs()).inverse();
-                    for s in &mut numer {
-                        *s *= norm_factor;
-                    }
+            if FK::use_cpu_zerocheck_mle() && !force_gpu_zc_site("logup_r0") {
+                // CPU fallback for fields where the GPU batch-MLE kernel is wrong (e.g. KB)
+                let cached_refs: Vec<&DeviceMatrix<FK::Val>> =
+                    air_ctx.cached_mains.iter().map(|cd| &cd.trace).collect();
+                if let Some([numer_poly, denom_poly]) =
+                    evaluate_round0_interactions_cpu_fallback::<FK>(
+                        &single_pk.vk.symbolic_constraints.constraints,
+                        &single_air_constraints,
+                        &cached_refs,
+                        &air_ctx.common_main,
+                        &xi[l_skip..l_skip + n_lift],
+                        single_pk.vk.params.need_rot,
+                        &self.beta_pows,
+                        eq_3bs,
+                        l_skip,
+                        n,
+                        height,
+                        num_cosets_logup,
+                        omega_root,
+                        &air_ctx.public_values,
+                    )?
+                {
+                    batch_sp_poly[2 * trace_idx] = numer_poly;
+                    batch_sp_poly[2 * trace_idx + 1] = denom_poly;
                 }
-                let mut numer_values = EF::zero_vec(num_cosets_logup << l_skip);
-                let mut denom_values = EF::zero_vec(num_cosets_logup << l_skip);
-                for coset_idx in 0..num_cosets_logup {
-                    for i in 0..1 << l_skip {
-                        let src = (coset_idx << l_skip) + i;
-                        let dst = i * num_cosets_logup + coset_idx;
-                        numer_values[dst] = numer[src];
-                        denom_values[dst] = denom[src];
+            } else {
+                let sum = evaluate_round0_interactions_gpu::<FK, HS>(
+                    single_pk,
+                    &single_air_constraints,
+                    selectors_cube.buffer(),
+                    &d_main_parts,
+                    public_values,
+                    eq_xi_tree.get_ptr(n_lift),
+                    &self.beta_pows,
+                    eq_3bs,
+                    1 << l_skip,
+                    1 << n_lift,
+                    height as u32,
+                    num_cosets_logup as u32,
+                    omega_root,
+                    max_temp_bytes,
+                )?;
+                if !sum.is_empty() {
+                    let evals = sum.to_host()?;
+                    let (mut numer, denom): (Vec<FK::ValExt>, Vec<FK::ValExt>) =
+                        evals.into_iter().map(|frac| (frac.p, frac.q)).unzip();
+                    if n.is_negative() {
+                        // normalize for lifting
+                        let norm_factor = FK::Val::from_u32(1 << n.unsigned_abs()).inverse();
+                        for s in &mut numer {
+                            *s *= norm_factor;
+                        }
                     }
+                    let mut numer_values = FK::ValExt::zero_vec(num_cosets_logup << l_skip);
+                    let mut denom_values = FK::ValExt::zero_vec(num_cosets_logup << l_skip);
+                    for coset_idx in 0..num_cosets_logup {
+                        for i in 0..1 << l_skip {
+                            let src = (coset_idx << l_skip) + i;
+                            let dst = i * num_cosets_logup + coset_idx;
+                            numer_values[dst] = numer[src];
+                            denom_values[dst] = denom[src];
+                        }
+                    }
+                    // Logup uses cosets 1, g^1, g^2, ... (init = 1, shift = omega_root)
+                    batch_sp_poly[2 * trace_idx] = UnivariatePoly::from_geometric_cosets_evals_idft(
+                        RowMajorMatrix::new(numer_values, num_cosets_logup),
+                        omega_root,
+                        FK::Val::ONE, // init = 1 for identity coset
+                    );
+                    batch_sp_poly[2 * trace_idx + 1] =
+                        UnivariatePoly::from_geometric_cosets_evals_idft(
+                            RowMajorMatrix::new(denom_values, num_cosets_logup),
+                            omega_root,
+                            FK::Val::ONE, // init = 1 for identity coset
+                        );
                 }
-                // Logup uses cosets 1, g^1, g^2, ... (init = 1, shift = omega_root)
-                batch_sp_poly[2 * trace_idx] = UnivariatePoly::from_geometric_cosets_evals_idft(
-                    RowMajorMatrix::new(numer_values, num_cosets_logup),
-                    omega_root,
-                    F::ONE, // init = 1 for identity coset
-                );
-                batch_sp_poly[2 * trace_idx + 1] = UnivariatePoly::from_geometric_cosets_evals_idft(
-                    RowMajorMatrix::new(denom_values, num_cosets_logup),
-                    omega_root,
-                    F::ONE, // init = 1 for identity coset
-                );
             }
         }
         self.mem
@@ -883,12 +1017,52 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         Ok(batch_sp_poly)
     }
 
+    /// CPU barycentric fold for one trace matrix (column-major base field → col-major ext field).
+    fn fold_ple_cpu(
+        l_skip: usize,
+        trace: &DeviceMatrix<FK::Val>,
+        r_0: FK::ValExt,
+        is_rot: bool,
+    ) -> Result<DeviceMatrix<FK::ValExt>, LogupZerocheckError> {
+        use openvm_cuda_common::copy::MemCopyH2D;
+        use p3_field::batch_multiplicative_inverse;
+        let cpu_mat = transport_matrix_d2h_col_major(trace).map_err(LogupZerocheckError::MemCopy)?;
+        let height = cpu_mat.height();
+        let width = cpu_mat.width();
+        let skip_sz = 1usize << l_skip;
+        let lifted_height = height.max(skip_sz);
+        let num_x = lifted_height / skip_sz;
+        let offset = usize::from(is_rot);
+        let omega = FK::Val::two_adic_generator(l_skip);
+        let omega_pows: Vec<FK::Val> = omega.powers().take(skip_sz).collect_vec();
+        let denoms: Vec<FK::ValExt> = omega_pows.iter().map(|&x_i| r_0 - FK::ValExt::from(x_i)).collect_vec();
+        let inv_denoms = batch_multiplicative_inverse(&denoms);
+        let col_scale: Vec<FK::ValExt> = omega_pows.iter().zip(&inv_denoms)
+            .map(|(&sg, &d_inv)| d_inv * FK::ValExt::from(sg)).collect_vec();
+        let r_pow_n = r_0.exp_power_of_2(l_skip);
+        let scaling_factor = (r_pow_n - FK::ValExt::ONE) * FK::ValExt::from_usize(skip_sz).inverse();
+        // Col-major output: values[col * num_x + x]
+        let mut out_vals = FK::ValExt::zero_vec(width * num_x);
+        for x in 0..num_x {
+            for z in 0..skip_sz {
+                let row_idx = ((x << l_skip) + z + offset) % height;
+                let w = col_scale[z];
+                for j in 0..width {
+                    out_vals[j * num_x + x] += w * FK::ValExt::from(cpu_mat.values[j * height + row_idx]);
+                }
+            }
+        }
+        for v in &mut out_vals { *v *= scaling_factor; }
+        let d_out = out_vals.to_device().map_err(LogupZerocheckError::MemCopy)?;
+        Ok(DeviceMatrix::new(Arc::new(d_out), num_x, width))
+    }
+
     // Note: there are no gpu sync points in this function, so span does not indicate kernel times
     #[instrument(name = "LogupZerocheck::fold_ple_evals", level = "debug", skip_all)]
     fn fold_ple_evals(
         &mut self,
         ctx: &ProvingContext<GenericGpuBackend<HS>>,
-        r_0: EF,
+        r_0: FK::ValExt,
     ) -> Result<(), LogupZerocheckError> {
         let l_skip = self.l_skip;
         let inv_lagrange_denoms_r0 =
@@ -896,56 +1070,81 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         let d_inv_lagrange_denoms_r0 = inv_lagrange_denoms_r0.to_device()?;
 
         let mut mem_limit = self.gkr_mem_contribution;
-        // GPU folding for mat_evals_per_trace
+        let use_cpu = FK::use_cpu_zerocheck_mle() && !force_gpu_zc_site("fold");
+        // GPU (or CPU fallback) folding for mat_evals_per_trace
         self.mat_evals_per_trace = ctx
             .per_trace
             .iter()
             .map(|(air_idx, air_ctx)| {
                 let air_pk = &self.pk.per_air[*air_idx];
                 let need_rot = air_pk.vk.params.need_rot;
-                let mut results: Vec<DeviceMatrix<EF>> = Vec::new();
+                let mut results: Vec<DeviceMatrix<FK::ValExt>> = Vec::new();
+
+                // Helper: fold a trace matrix using CPU, creating doubled-width matrix when need_rot=true
+                // to match the GPU convention expected by into_column_openings.
+                let fold_cpu_with_rot = |trace: &DeviceMatrix<FK::Val>|
+                    -> Result<DeviceMatrix<FK::ValExt>, LogupZerocheckError> {
+                    use openvm_cuda_common::copy::MemCopyH2D;
+                    let local = Self::fold_ple_cpu(l_skip, trace, r_0, false)?;
+                    if !need_rot {
+                        return Ok(local);
+                    }
+                    // Combine local + rotated into one doubled-width column-major matrix.
+                    let rotated = Self::fold_ple_cpu(l_skip, trace, r_0, true)?;
+                    let h = local.height();
+                    let w = local.width();
+                    debug_assert_eq!(rotated.height(), h);
+                    debug_assert_eq!(rotated.width(), w);
+                    let local_h = local.buffer().to_host().map_err(LogupZerocheckError::MemCopy)?;
+                    let rot_h = rotated.buffer().to_host().map_err(LogupZerocheckError::MemCopy)?;
+                    // Build column-major: cols 0..w-1 = local, cols w..2w-1 = rotated
+                    let mut combined = FK::ValExt::zero_vec(2 * w * h);
+                    for col in 0..w {
+                        for row in 0..h {
+                            combined[col * h + row] = local_h[col * h + row];
+                            combined[(col + w) * h + row] = rot_h[col * h + row];
+                        }
+                    }
+                    let d_combined = combined.to_device().map_err(LogupZerocheckError::MemCopy)?;
+                    Ok(DeviceMatrix::new(Arc::new(d_combined), h, 2 * w))
+                };
 
                 // Preprocessed (if exists)
                 if let Some(committed) = &air_pk.preprocessed_data {
                     let trace = &committed.trace;
-                    let folded = fold_ple_evals_rotate(
-                        l_skip,
-                        &self.d_omega_skip_pows,
-                        trace,
-                        &d_inv_lagrange_denoms_r0,
-                        need_rot,
-                    )?;
+                    let folded = if use_cpu {
+                        fold_cpu_with_rot(trace)?
+                    } else {
+                        fold_ple_evals_rotate::<FK>(l_skip, &self.d_omega_skip_pows, trace, &d_inv_lagrange_denoms_r0, need_rot)?
+                    };
                     results.push(folded);
                 }
 
                 // Cached mains
                 for committed in &air_ctx.cached_mains {
                     let trace = &committed.trace;
-                    let folded = fold_ple_evals_rotate(
-                        l_skip,
-                        &self.d_omega_skip_pows,
-                        trace,
-                        &d_inv_lagrange_denoms_r0,
-                        need_rot,
-                    )?;
+                    let folded = if use_cpu {
+                        fold_cpu_with_rot(trace)?
+                    } else {
+                        fold_ple_evals_rotate::<FK>(l_skip, &self.d_omega_skip_pows, trace, &d_inv_lagrange_denoms_r0, need_rot)?
+                    };
                     results.push(folded);
                 }
 
                 // Common main
                 let trace = &air_ctx.common_main;
-                let folded = fold_ple_evals_rotate(
-                    l_skip,
-                    &self.d_omega_skip_pows,
-                    trace,
-                    &d_inv_lagrange_denoms_r0,
-                    need_rot,
-                )?;
-                mem_limit = mem_limit.saturating_sub(folded.buffer().len() * size_of::<EF>());
+                let folded = if use_cpu {
+                    fold_cpu_with_rot(trace)?
+                } else {
+                    fold_ple_evals_rotate::<FK>(l_skip, &self.d_omega_skip_pows, trace, &d_inv_lagrange_denoms_r0, need_rot)?
+                };
+                mem_limit =
+                    mem_limit.saturating_sub(folded.buffer().len() * size_of::<FK::ValExt>());
                 results.push(folded);
 
                 Ok(results)
             })
-            .collect::<Result<Vec<_>, FoldPleError>>()?;
+            .collect::<Result<Vec<_>, LogupZerocheckError>>()?;
         if self.save_memory {
             self.memory_limit_bytes = mem_limit;
         }
@@ -967,12 +1166,12 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                 } else {
                     (l_skip, r_0)
                 };
-                let omega = F::two_adic_generator(l);
+                let omega = FK::Val::two_adic_generator(l);
                 let is_first = eval_eq_uni_at_one(l, r);
                 let is_last = eval_eq_uni_at_one(l, r * omega);
-                let folded_buf = DeviceBuffer::<EF>::with_capacity(num_x * 3);
+                let folded_buf = DeviceBuffer::<FK::ValExt>::with_capacity(num_x * 3);
                 unsafe {
-                    fold_selectors_round0(
+                    FK::fold_selectors_round0(
                         folded_buf.as_mut_ptr(),
                         selectors_cube.buffer().as_ptr(),
                         is_first,
@@ -1009,23 +1208,269 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         skip_all,
         fields(round = round)
     )]
+    /// CPU fallback for KB: computes batch sumcheck polynomial evaluations on CPU for round k.
+    /// Downloads the GPU folded trace matrices, evaluates interactions using natural-order eq.
+    fn sumcheck_polys_batch_eval_cpu(
+        &mut self,
+        round: usize,
+        r_prev: FK::ValExt,
+    ) -> Result<Vec<Vec<FK::ValExt>>, LogupZerocheckError> {
+        let sp_deg = self.constraint_degree;
+        let l_skip = self.l_skip;
+        let num_traces = self.n_per_trace.len();
+
+        let mut zc_out = vec![vec![FK::ValExt::ZERO; sp_deg]; num_traces];
+        let mut logup_out: Vec<[Vec<FK::ValExt>; 2]> = vec![
+            [vec![FK::ValExt::ZERO; sp_deg], vec![FK::ValExt::ZERO; sp_deg]];
+            num_traces
+        ];
+
+        for (trace_idx, (&n, mats, sels, &air_idx)) in izip!(
+            self.n_per_trace.iter(),
+            self.mat_evals_per_trace.iter(),
+            self.sels_per_trace.iter(),
+            self.air_indices_per_trace.iter(),
+        )
+        .enumerate()
+        {
+            let pk = &self.pk.per_air[air_idx];
+            let local_deg = pk.vk.max_constraint_degree as usize;
+            let has_constraints = local_deg > 0;
+            let has_interactions = !pk.vk.symbolic_constraints.interactions.is_empty();
+            if !has_interactions && !has_constraints {
+                continue;
+            }
+            let n_lift = n.max(0) as usize;
+            let norm_factor_denom: usize = 1 << ((-n).max(0) as usize);
+            let norm_factor = FK::Val::from_usize(norm_factor_denom).inverse();
+            let symbolic = SymbolicConstraints::from(&pk.vk.symbolic_constraints);
+            let need_rot = self.needs_next_per_trace[trace_idx];
+            let pvs_host: Vec<FK::Val> = if self.public_values_per_trace[trace_idx].is_empty() {
+                vec![]
+            } else {
+                self.public_values_per_trace[trace_idx]
+                    .to_host()
+                    .map_err(LogupZerocheckError::MemCopy)?
+            };
+            let lambda_host: Vec<FK::ValExt> = match self.lambda_pows.as_ref() {
+                Some(d) if !d.is_empty() => d.to_host().map_err(LogupZerocheckError::MemCopy)?,
+                _ => vec![],
+            };
+            let eq_3bs = &self.eq_3b_per_trace[trace_idx];
+            let beta_pows = &self.beta_pows;
+
+            // Build EvalHelper for interactions.
+            // preprocessed_trace: None because GPU committed preprocessed data can't be
+            // used as CPU StridedColMajorMatrixView; if mats[0] is preprocessed (from
+            // air_pk.preprocessed_data), it becomes partitioned_main[0] harmlessly for
+            // interactions that only reference Main entries (not Preprocessed entries).
+            let eval_helper = EvalHelper {
+                constraints_dag: &pk.vk.symbolic_constraints.constraints,
+                interactions: symbolic.interactions.clone(),
+                public_values: pvs_host,
+                preprocessed_trace: None,
+                needs_next: need_rot,
+                constraint_degree: local_deg as u8,
+            };
+
+            if round <= n_lift {
+                // Case B: trace has height 2*num_y, evaluate sumcheck poly at x=1..s_deg
+                let log_num_y = n_lift - round;
+                let num_y = 1usize << log_num_y;
+
+                // Download ALL folded matrices (preprocessed, cached_mains, common_main)
+                // and selectors.
+                let all_mats_cpu: Vec<_> = mats
+                    .iter()
+                    .map(|m| transport_matrix_d2h_col_major(m).map_err(LogupZerocheckError::MemCopy))
+                    .collect::<Result<_, _>>()?;
+                let sel_cpu = transport_matrix_d2h_col_major(sels)
+                    .map_err(LogupZerocheckError::MemCopy)?;
+
+                let height = all_mats_cpu[0].height();
+                debug_assert_eq!(height, 2 * num_y);
+                // Natural-order eq for remaining xi[round..n_lift]
+                let eq_cpu = evals_eq_hypercube_serial(&self.xi[l_skip + round..l_skip + n_lift]);
+
+                let sel_vals: &[FK::ValExt] = &sel_cpu.values;
+
+                for xi_idx in 1..=sp_deg {
+                    let x_ef = FK::ValExt::from_usize(xi_idx);
+                    let mut numer_x = FK::ValExt::ZERO;
+                    let mut denom_x = FK::ValExt::ZERO;
+                    let mut zc_x = FK::ValExt::ZERO;
+
+                    for y in 0..num_y {
+                        // Interpolate selectors (col-major: values[col * height + row])
+                        let sel_y_x: Vec<FK::ValExt> = (0..3)
+                            .map(|k| {
+                                let t0 = sel_vals[k * height + 2 * y];
+                                let t1 = sel_vals[k * height + 2 * y + 1];
+                                t0 + (t1 - t0) * x_ef
+                            })
+                            .collect();
+                        // Build row_parts matching EvalHelper.view_mats order: selectors, then
+                        // each matrix split into (local, rotated) when need_rot (matrices are
+                        // doubled-width [local_cols | rotated_cols] in that case).
+                        let mut row_parts = vec![sel_y_x];
+                        for mat_cpu in &all_mats_cpu {
+                            let mat_vals = &mat_cpu.values;
+                            let w = mat_cpu.width();
+                            let aw = if need_rot { w / 2 } else { w };
+                            let interp = |c0: usize, c1: usize| -> Vec<FK::ValExt> {
+                                (c0..c1)
+                                    .map(|j| {
+                                        let t0 = mat_vals[j * height + 2 * y];
+                                        let t1 = mat_vals[j * height + 2 * y + 1];
+                                        t0 + (t1 - t0) * x_ef
+                                    })
+                                    .collect()
+                            };
+                            row_parts.push(interp(0, aw));
+                            if need_rot {
+                                row_parts.push(interp(aw, w));
+                            }
+                        }
+
+                        let eq_w = eq_cpu[y];
+                        if has_interactions {
+                            let [n_val, d_val] =
+                                eval_helper.acc_interactions(&row_parts, beta_pows, eq_3bs);
+                            numer_x = numer_x + eq_w * n_val * norm_factor;
+                            denom_x = denom_x + eq_w * d_val;
+                        }
+                        if has_constraints {
+                            // Zerocheck: sum_y eq(xi, y) * batched_constraints(row).
+                            // No norm_factor for zerocheck (matches CPU reference).
+                            let c_val = eval_helper.acc_constraints(&row_parts, &lambda_host);
+                            zc_x = zc_x + eq_w * c_val;
+                        }
+                    }
+                    logup_out[trace_idx][0][xi_idx - 1] = numer_x;
+                    logup_out[trace_idx][1][xi_idx - 1] = denom_x;
+                    zc_out[trace_idx][xi_idx - 1] = zc_x;
+                }
+            } else if round == n_lift + 1 {
+                // Case A.1: single-row evaluation, sets logup_tilde_evals
+                // Download ALL matrices for multi-partition chips.
+                let all_mats_cpu: Vec<_> = mats
+                    .iter()
+                    .map(|m| transport_matrix_d2h_col_major(m).map_err(LogupZerocheckError::MemCopy))
+                    .collect::<Result<_, _>>()?;
+                let sel_cpu = transport_matrix_d2h_col_major(sels)
+                    .map_err(LogupZerocheckError::MemCopy)?;
+
+                debug_assert_eq!(all_mats_cpu[0].height(), 1);
+                // height=1: column j value is values[j]. Split doubled-width into local/rot.
+                let sel_vals: Vec<FK::ValExt> = sel_cpu.values.clone();
+                let mut row_parts = vec![sel_vals];
+                for mat_cpu in &all_mats_cpu {
+                    let mv = &mat_cpu.values;
+                    let w = mat_cpu.width();
+                    let aw = if need_rot { w / 2 } else { w };
+                    row_parts.push((0..aw).map(|j| mv[j]).collect());
+                    if need_rot {
+                        row_parts.push((aw..w).map(|j| mv[j]).collect());
+                    }
+                }
+
+                if has_interactions {
+                    let [n_val, d_val] =
+                        eval_helper.acc_interactions(&row_parts, beta_pows, eq_3bs);
+                    self.logup_tilde_evals[trace_idx][0] = n_val * norm_factor;
+                    self.logup_tilde_evals[trace_idx][1] = d_val;
+                }
+                if has_constraints {
+                    let c_val = eval_helper.acc_constraints(&row_parts, &lambda_host);
+                    self.zerocheck_tilde_evals[trace_idx] = c_val;
+                }
+            }
+            // Case A.2 (round > n_lift + 1): accumulate tilde evals by r_prev — handled below
+        }
+
+        // Case A.2: scale tilde evals by r_prev for all traces with round > n_lift + 1
+        for (trace_idx, &n) in self.n_per_trace.iter().enumerate() {
+            let n_lift = n.max(0) as usize;
+            if round > n_lift + 1 {
+                let pk = &self.pk.per_air[self.air_indices_per_trace[trace_idx]];
+                if !pk.vk.symbolic_constraints.interactions.is_empty() {
+                    for x in self.logup_tilde_evals[trace_idx].iter_mut() {
+                        *x = *x * r_prev;
+                    }
+                }
+                if pk.vk.max_constraint_degree > 0 {
+                    self.zerocheck_tilde_evals[trace_idx] =
+                        self.zerocheck_tilde_evals[trace_idx] * r_prev;
+                }
+            }
+        }
+
+        Ok(logup_out.into_iter().flatten().chain(zc_out).collect())
+    }
+
     fn sumcheck_polys_batch_eval(
         &mut self,
         round: usize,
-        r_prev: EF,
-    ) -> Result<Vec<Vec<EF>>, LogupZerocheckError> {
+        r_prev: FK::ValExt,
+    ) -> Result<Vec<Vec<FK::ValExt>>, LogupZerocheckError> {
+        if FK::use_cpu_zerocheck_mle() && !force_gpu_zc_site("mle") {
+            let cpu = self.sumcheck_polys_batch_eval_cpu(round, r_prev)?;
+            // Optional GPU-vs-CPU verification of the MLE sumcheck polys (proof uses CPU).
+            // Both paths read the same (CPU-folded) device state read-only.
+            if std::env::var("SWIRL_VERIFY_MLE").is_ok() {
+                let gpu = self.sumcheck_polys_batch_eval_gpu(round, r_prev)?;
+                let n = cpu.len().min(gpu.len());
+                let mut mism = 0usize;
+                let mut first = None;
+                for i in 0..n {
+                    for j in 0..cpu[i].len().min(gpu[i].len()) {
+                        if cpu[i][j] != gpu[i][j] {
+                            mism += 1;
+                            if first.is_none() {
+                                first = Some((i, j, cpu[i][j], gpu[i][j]));
+                            }
+                        }
+                    }
+                }
+                if mism > 0 {
+                    let (i, j, c, g) = first.unwrap();
+                    tracing::warn!(
+                        "MLE_VERIFY round={round}: {mism} poly-coeff mismatch; first at \
+                         vec_idx={i} coeff={j} CPU={c:?} GPU={g:?} (n_vecs cpu={} gpu={})",
+                        cpu.len(), gpu.len()
+                    );
+                } else {
+                    tracing::warn!("MLE_VERIFY round={round}: OK ({} vecs match)", cpu.len());
+                }
+            }
+            return Ok(cpu);
+        }
+        self.sumcheck_polys_batch_eval_gpu(round, r_prev)
+    }
+
+    fn sumcheck_polys_batch_eval_gpu(
+        &mut self,
+        round: usize,
+        r_prev: FK::ValExt,
+    ) -> Result<Vec<Vec<FK::ValExt>>, LogupZerocheckError> {
         let sp_deg = self.constraint_degree;
 
         // Per-trace outputs (filled as we go)
-        let mut zc_out: Vec<Vec<EF>> = vec![vec![EF::ZERO; sp_deg]; self.n_per_trace.len()];
-        let mut logup_out: Vec<[Vec<EF>; 2]> =
-            vec![[vec![EF::ZERO; sp_deg], vec![EF::ZERO; sp_deg]]; self.n_per_trace.len()];
+        let mut zc_out: Vec<Vec<FK::ValExt>> =
+            vec![vec![FK::ValExt::ZERO; sp_deg]; self.n_per_trace.len()];
+        let mut logup_out: Vec<[Vec<FK::ValExt>; 2]> = vec![
+            [
+                vec![FK::ValExt::ZERO; sp_deg],
+                vec![FK::ValExt::ZERO; sp_deg]
+            ];
+            self.n_per_trace.len()
+        ];
 
         // Keep early interpolations alive for duration of kernels
-        let mut _keepalive_interpolated: Vec<DeviceMatrix<EF>> = Vec::new();
+        let mut _keepalive_interpolated: Vec<DeviceMatrix<FK::ValExt>> = Vec::new();
 
-        let mut late_eval: Vec<TraceCtx> = Vec::new(); // round == n_lift + 1
-        let mut early_eval: Vec<TraceCtx> = Vec::new(); // round <= n_lift
+        let mut late_eval: Vec<TraceCtx<FK>> = Vec::new(); // round == n_lift + 1
+        let mut early_eval: Vec<TraceCtx<FK>> = Vec::new(); // round <= n_lift
 
         // First, handle traces in original order and split into cases
         for (trace_idx, (&n, mats, sels, eq_3bs, public_vals, &air_idx)) in izip!(
@@ -1048,7 +1493,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
 
             let n_lift = n.max(0) as usize;
             let norm_factor_denom = 1 << (-n).max(0);
-            let norm_factor = F::from_usize(norm_factor_denom).inverse();
+            let norm_factor = FK::Val::from_usize(norm_factor_denom).inverse();
             let has_preprocessed = pk.preprocessed_data.is_some();
             let need_rot = pk.vk.params.need_rot;
             let first_main_idx = usize::from(has_preprocessed);
@@ -1069,7 +1514,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                             air_width: 0,
                         }
                     };
-                    let main_ptrs: Vec<MainMatrixPtrs<EF>> = mats[first_main_idx..]
+                    let main_ptrs: Vec<MainMatrixPtrs<FK::ValExt>> = mats[first_main_idx..]
                         .iter()
                         .map(|m| MainMatrixPtrs {
                             data: m.buffer().as_ptr(),
@@ -1116,7 +1561,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                 let height = 2 * num_y;
                 debug_assert_eq!(height, mats[0].height());
 
-                let mut columns: Vec<*const EF> = Vec::new();
+                let mut columns: Vec<*const FK::ValExt> = Vec::new();
                 columns.extend(
                     iter::once(sels)
                         .chain(mats.iter())
@@ -1127,10 +1572,11 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                         })
                         .collect_vec(),
                 );
-                let interpolated = DeviceMatrix::<EF>::with_capacity(sp_deg * num_y, columns.len());
+                let interpolated =
+                    DeviceMatrix::<FK::ValExt>::with_capacity(sp_deg * num_y, columns.len());
                 let d_columns = columns.to_device()?;
                 unsafe {
-                    interpolate_columns_gpu(interpolated.buffer(), &d_columns, sp_deg, num_y)
+                    FK::interpolate_columns_gpu(interpolated.buffer(), &d_columns, sp_deg, num_y)
                         .map_err(|e| LogupZerocheckError::InterpolateColumns(e.into()))?;
                 }
 
@@ -1158,7 +1604,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                 if has_preprocessed {
                     widths_so_far += mats[0].width();
                 }
-                let main_ptrs: Vec<MainMatrixPtrs<EF>> = mats[first_main_idx..]
+                let main_ptrs: Vec<MainMatrixPtrs<FK::ValExt>> = mats[first_main_idx..]
                     .iter()
                     .map(|m| {
                         let main_ptr = MainMatrixPtrs {
@@ -1216,7 +1662,8 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                 .map_err(LogupZerocheckError::MleInteractionEval)?;
             let host = out.to_host()?;
             for (i, trace_idx) in batch.trace_indices().enumerate() {
-                self.logup_tilde_evals[trace_idx][0] = host[i].p * late_logup_traces[i].norm_factor;
+                self.logup_tilde_evals[trace_idx][0] =
+                    host[i].p * late_logup_traces[i].norm_factor;
                 self.logup_tilde_evals[trace_idx][1] = host[i].q;
             }
         }
@@ -1257,20 +1704,29 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         }
 
         // Early traces (num_y>1): partition by threshold for zerocheck path
-        let (low_early, high_early): (Vec<&TraceCtx>, Vec<&TraceCtx>) = early_eval
+        let (low_early, high_early): (Vec<&TraceCtx<FK>>, Vec<&TraceCtx<FK>>) = early_eval
             .iter()
             .filter(|t| t.has_constraints)
             .partition(|t| t.num_y <= self.monomial_num_y_threshold);
 
         // Partition high num_y traces by monomial-to-rules ratio
         // (traces without monomials are skipped - they contribute zero)
-        let (high_dag_traces, high_mono_traces): (Vec<&TraceCtx>, Vec<&TraceCtx>) =
+        let (high_dag_traces, high_mono_traces): (Vec<&TraceCtx<FK>>, Vec<&TraceCtx<FK>>) =
             high_early.iter().partition(|t| {
                 let num_monomials = get_num_monomials(t, self.pk);
                 let rules_len = get_zerocheck_rules_len(t, self.pk);
                 // Use DAG when monomial expansion significantly increased the term count
                 num_monomials as usize >= DAG_FALLBACK_MONOMIAL_RATIO * rules_len
             });
+
+        if std::env::var("SWIRL_DUMP_MLE_PATH").is_ok() {
+            tracing::warn!(
+                "MLE_PATH round={round}: high_dag={:?} high_mono={:?} low_early={:?}",
+                high_dag_traces.iter().map(|t| t.trace_idx).collect::<Vec<_>>(),
+                high_mono_traces.iter().map(|t| t.trace_idx).collect::<Vec<_>>(),
+                low_early.iter().map(|t| t.trace_idx).collect::<Vec<_>>(),
+            );
+        }
 
         // DAG evaluation for high num_y traces with high monomial-to-rules ratio
         if !high_dag_traces.is_empty() {
@@ -1332,17 +1788,17 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
     #[instrument(level = "debug", skip_all, fields(round = round))]
     fn compute_batch_s_poly(
         &mut self,
-        sp_round_evals: Vec<Vec<EF>>,
+        sp_round_evals: Vec<Vec<FK::ValExt>>,
         num_traces: usize,
         round: usize,
-        mu_pows: &[EF],
-    ) -> UnivariatePoly<EF> {
+        mu_pows: &[FK::ValExt],
+    ) -> UnivariatePoly<FK::ValExt> {
         debug_assert_eq!(sp_round_evals.len(), 3 * num_traces);
         debug_assert_eq!(sp_round_evals.len(), mu_pows.len());
         let constraint_degree = self.constraint_degree;
-        let mut sp_head_zc = vec![EF::ZERO; constraint_degree];
-        let mut sp_head_logup = vec![EF::ZERO; constraint_degree];
-        let mut sp_tail = EF::ZERO;
+        let mut sp_head_zc = vec![FK::ValExt::ZERO; constraint_degree];
+        let mut sp_head_logup = vec![FK::ValExt::ZERO; constraint_degree];
+        let mut sp_tail = FK::ValExt::ZERO;
         for (trace_idx, &n) in self.n_per_trace.iter().enumerate() {
             let n_lift = n.max(0) as usize;
             let zc_idx = 2 * num_traces + trace_idx;
@@ -1370,7 +1826,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         let s_deg = constraint_degree + 1;
         let l_skip = self.l_skip;
         // With eq(xi,r) contributions
-        let mut sp_head_evals = vec![EF::ZERO; s_deg];
+        let mut sp_head_evals = vec![FK::ValExt::ZERO; s_deg];
         for i in 0..constraint_degree {
             sp_head_evals[i + 1] = self.eq_ns[round - 1] * sp_head_zc[i]
                 + self.eq_sharp_ns[round - 1] * sp_head_logup[i];
@@ -1379,22 +1835,22 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         // We use that s_j(0) + s_j(1) = s_{j-1}(r_{j-1})
         let xi_cur = self.xi[l_skip + round - 1];
         {
-            let eq_xi_0 = EF::ONE - xi_cur;
+            let eq_xi_0 = FK::ValExt::ONE - xi_cur;
             let eq_xi_1 = xi_cur;
             sp_head_evals[0] =
                 (self.prev_s_eval - eq_xi_1 * sp_head_evals[1] - sp_tail) * eq_xi_0.inverse();
         }
         // s' has degree s_deg - 1
         let sp_head = UnivariatePoly::lagrange_interpolate(
-            &(0..s_deg).map(F::from_usize).collect_vec(),
+            &(0..s_deg).map(FK::Val::from_usize).collect_vec(),
             &sp_head_evals,
         );
         // eq(xi, X) = (2 * xi - 1) * X + (1 - xi)
         // Compute s(X) = eq(xi, X) * s'_head(X) + s'_tail * X (s'_head now contains eq(..,r))
         // s(X) has degree s_deg
         let mut coeffs = sp_head.into_coeffs();
-        coeffs.push(EF::ZERO);
-        let b = EF::ONE - xi_cur;
+        coeffs.push(FK::ValExt::ZERO);
+        let b = FK::ValExt::ONE - xi_cur;
         let a = xi_cur - b;
         for i in (0..s_deg).rev() {
             coeffs[i + 1] = a * coeffs[i] + b * coeffs[i + 1];
@@ -1405,9 +1861,16 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
     }
 
     #[instrument(name = "LogupZerocheck::fold_mle_evals", level = "debug", skip_all, fields(round = round))]
-    fn fold_mle_evals(&mut self, round: usize, r_round: EF) -> Result<(), LogupZerocheckError> {
+    fn fold_mle_evals(
+        &mut self,
+        round: usize,
+        r_round: FK::ValExt,
+    ) -> Result<(), LogupZerocheckError> {
         // Assumes that input_mats are sorted by height
-        let batch_fold = |input_mats: Vec<DeviceMatrix<EF>>| -> Result<Vec<DeviceMatrix<EF>>, LogupZerocheckError> {
+        let batch_fold = |input_mats: Vec<DeviceMatrix<FK::ValExt>>| -> Result<
+            Vec<DeviceMatrix<FK::ValExt>>,
+            LogupZerocheckError,
+        > {
             let num_matrices = input_mats.partition_point(|mat| mat.height() > 1);
             let mut max_output_cells = 0;
             let (log_output_heights, widths, mut output_mats): (Vec<_>, Vec<_>, Vec<_>) =
@@ -1419,7 +1882,8 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                         let width = mat.width();
                         let output_height = height >> 1;
                         max_output_cells = max(max_output_cells, output_height * width);
-                        let output_mat = DeviceMatrix::<EF>::with_capacity(output_height, width);
+                        let output_mat =
+                            DeviceMatrix::<FK::ValExt>::with_capacity(output_height, width);
                         (output_height.ilog2() as u8, width as u32, output_mat)
                     })
                     .multiunzip();
@@ -1440,7 +1904,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             let d_widths = widths.to_device()?;
 
             unsafe {
-                batch_fold_mle(
+                FK::batch_fold_mle(
                     &d_input_ptrs,
                     &d_output_ptrs,
                     &d_widths,
@@ -1455,7 +1919,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
             Ok(output_mats)
         };
 
-        // Fold mat_evals_per_trace: Vec<Vec<DeviceMatrix<EF>>>
+        // Fold mat_evals_per_trace: Vec<Vec<DeviceMatrix<FK::ValExt>>>
         self.mat_evals_per_trace = {
             let lengths = self
                 .mat_evals_per_trace
@@ -1477,12 +1941,12 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
                 self.mat_evals_per_trace
                     .iter()
                     .flatten()
-                    .map(|m| m.buffer().len() * size_of::<EF>())
+                    .map(|m| m.buffer().len() * size_of::<FK::ValExt>())
                     .sum(),
             );
         }
 
-        // Fold sels_per_trace: Vec<DeviceMatrix<EF>>
+        // Fold sels_per_trace: Vec<DeviceMatrix<FK::ValExt>>
         self.sels_per_trace = batch_fold(std::mem::take(&mut self.sels_per_trace))?;
 
         for tree in self.eq_xis.values_mut() {
@@ -1503,7 +1967,9 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         level = "debug",
         skip_all
     )]
-    fn into_column_openings(mut self) -> Result<Vec<Vec<Vec<EF>>>, LogupZerocheckError> {
+    fn into_column_openings(
+        mut self,
+    ) -> Result<Vec<Vec<Vec<FK::ValExt>>>, LogupZerocheckError> {
         let num_airs_present = self.mat_evals_per_trace.len();
         let mut column_openings = Vec::with_capacity(num_airs_present);
 
@@ -1516,7 +1982,7 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
         {
             // GPU matrices are doubled-width (original + rotated), so we need to split them
             // First, copy all matrices to host and split them
-            let mut split_mats: Vec<Option<ColMajorMatrix<EF>>> = mat_evals
+            let mut split_mats: Vec<Option<ColMajorMatrix<FK::ValExt>>> = mat_evals
                 .into_iter()
                 .map(|mat| {
                     let mat_host = transport_matrix_d2h_col_major(&mat)?;
@@ -1536,10 +2002,10 @@ impl<'a, HS: GpuHashScheme> LogupZerocheckGpu<'a, HS> {
 
                     // Split doubled-width matrix into original and rotated parts
                     let values = &mat_host.values;
-                    let orig: Vec<EF> = (0..air_width)
+                    let orig: Vec<FK::ValExt> = (0..air_width)
                         .map(|col| values[col * height]) // height=1, so values[col]
                         .collect();
-                    let rot: Option<Vec<EF>> = if need_rot {
+                    let rot: Option<Vec<FK::ValExt>> = if need_rot {
                         Some(
                             (air_width..width)
                                 .map(|col| values[col * height]) // height=1, so values[col]

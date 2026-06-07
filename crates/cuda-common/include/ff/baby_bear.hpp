@@ -498,7 +498,9 @@ private:
 
         // c[0]*c[0] - beta*(c[1]*bb31_t{u[3]<<1} - c[2]*c[2]);
         wl  = u[1] * (uint64_t)(u[3]<<1);
-        wl += u[2] * (uint64_t)(MOD-u[2]);
+        wl += u[2] * (uint64_t)(MOD-u[2]);  final_sub(w[1]);
+        // ^ BUGFIX (mirrors koala_bear_ext.hpp): final_sub the high word before adding the REDC
+        // term, otherwise the two unreduced products + REDC can overflow uint64 for large inputs.
         wl += (w[0] * M) * (uint64_t)MOD;   final_sub(w[1]);
         wl  = w[1] * (uint64_t)(MOD-BETA);
         wl += u[0] * (uint64_t)u[0];

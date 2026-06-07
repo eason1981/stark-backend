@@ -14,16 +14,41 @@ use tracing::instrument;
 
 use crate::{
     base::DeviceMatrix,
+    cuda::field_kernels::{BabyBearKernels, FieldKernels},
     hash_scheme::{DefaultHashScheme, GpuHashScheme},
     logup_zerocheck::prove_zerocheck_and_logup_gpu,
     merkle_tree::{MerkleProofQueryDigest, MerkleTreeConstructor},
-    prelude::{D_EF, EF, F},
+    prelude::{D_EF},
     sponge::GpuFiatShamirTranscript,
     stacked_pcs::{stacked_commit, StackedPcsDataGpu},
     stacked_reduction::prove_stacked_opening_reduction_gpu,
     whir::prove_whir_opening_gpu,
     AirDataGpu, GpuDevice, ProverError,
 };
+
+/// Associates a `GpuHashScheme` with the correct `FieldKernels` implementation
+/// for the GPU proving pipeline (stacked reduction + WHIR).
+///
+/// Concrete impls:
+/// - `DefaultHashScheme` (BabyBear) → `BabyBearKernels`
+/// - `KoalaBearPoseidon2HashScheme` → `KoalaBearKernels`
+pub trait FieldKernelsFor<HS: GpuHashScheme> {
+    type FK: FieldKernels<Val = HS::BaseField, ValExt = HS::ExtField>;
+}
+
+impl FieldKernelsFor<DefaultHashScheme> for GpuDevice {
+    type FK = BabyBearKernels;
+}
+
+#[cfg(feature = "baby-bear-bn254-poseidon2")]
+impl FieldKernelsFor<crate::hash_scheme::BabyBearBn254Poseidon2HashScheme> for GpuDevice {
+    type FK = BabyBearKernels;
+}
+
+#[cfg(feature = "koala-bear-poseidon2")]
+impl FieldKernelsFor<crate::hash_scheme::KoalaBearPoseidon2HashScheme> for GpuDevice {
+    type FK = crate::cuda::field_kernels::KoalaBearKernels;
+}
 
 /// Generic GPU prover backend parameterised by a hash scheme `HS`.
 ///
@@ -42,14 +67,14 @@ impl<HS: GpuHashScheme> Default for GenericGpuBackend<HS> {
 pub type GpuBackend = GenericGpuBackend<DefaultHashScheme>;
 
 impl<HS: GpuHashScheme> ProverBackend for GenericGpuBackend<HS> {
-    const CHALLENGE_EXT_DEGREE: u8 = D_EF as u8;
+    const CHALLENGE_EXT_DEGREE: u8 = D_EF as u8;  // 4 for both BB and KB
 
-    type Val = F;
-    type Challenge = EF;
+    type Val = HS::BaseField;
+    type Challenge = HS::ExtField;
     type Commitment = HS::Digest;
-    type Matrix = DeviceMatrix<F>;
-    type PcsData = StackedPcsDataGpu<F, HS::Digest>;
-    type OtherAirData = AirDataGpu;
+    type Matrix = DeviceMatrix<HS::BaseField>;
+    type PcsData = StackedPcsDataGpu<HS::BaseField, HS::Digest>;
+    type OtherAirData = AirDataGpu<HS::BaseField>;
 }
 
 impl<HS: GpuHashScheme> TraceCommitter<GenericGpuBackend<HS>> for GpuDevice
@@ -60,9 +85,9 @@ where
 
     fn commit(
         &self,
-        traces: &[&DeviceMatrix<F>],
-    ) -> Result<(HS::Digest, StackedPcsDataGpu<F, HS::Digest>), Self::Error> {
-        stacked_commit::<HS::MerkleHash>(
+        traces: &[&DeviceMatrix<HS::BaseField>],
+    ) -> Result<(HS::Digest, StackedPcsDataGpu<HS::BaseField, HS::Digest>), Self::Error> {
+        stacked_commit::<HS::BaseField, HS::MerkleHash>(
             self.config.l_skip,
             self.config.n_stack,
             self.config.log_blowup,
@@ -73,9 +98,10 @@ where
     }
 }
 
-impl<HS: GpuHashScheme, TS: GpuFiatShamirTranscript<HS::SC>> ProverDevice<GenericGpuBackend<HS>, TS>
-    for GpuDevice
+impl<HS: GpuHashScheme, TS: GpuFiatShamirTranscript<HS::SC>>
+    ProverDevice<GenericGpuBackend<HS>, TS> for GpuDevice
 where
+    GpuDevice: FieldKernelsFor<HS>,
     HS::MerkleHash: MerkleTreeConstructor,
     HS::Digest: MerkleProofQueryDigest,
 {
@@ -84,11 +110,11 @@ where
 
 impl<HS: GpuHashScheme, TS: GpuFiatShamirTranscript<HS::SC>>
     MultiRapProver<GenericGpuBackend<HS>, TS> for GpuDevice
+where
+    GpuDevice: FieldKernelsFor<HS>,
 {
     type PartialProof = (GkrProof<HS::SC>, BatchConstraintProof<HS::SC>);
-    /// The random opening point `r` where the batch constraint sumcheck reduces to evaluation
-    /// claims of trace matrices `T, T_{rot}` at `r_{n_T}`.
-    type Artifacts = Vec<EF>;
+    type Artifacts = Vec<HS::ExtField>;
     type Error = ProverError;
 
     #[allow(clippy::type_complexity)]
@@ -98,22 +124,23 @@ impl<HS: GpuHashScheme, TS: GpuFiatShamirTranscript<HS::SC>>
         transcript: &mut TS,
         mpk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
         ctx: &ProvingContext<GenericGpuBackend<HS>>,
-        _common_main_pcs_data: &StackedPcsDataGpu<F, HS::Digest>,
-    ) -> Result<((GkrProof<HS::SC>, BatchConstraintProof<HS::SC>), Vec<EF>), Self::Error> {
+        common_main_pcs_data: &StackedPcsDataGpu<HS::BaseField, HS::Digest>,
+    ) -> Result<((GkrProof<HS::SC>, BatchConstraintProof<HS::SC>), Vec<HS::ExtField>), Self::Error>
+    {
         let mem = MemTracker::start_and_reset_peak("prover.rap_constraints");
         let save_memory = self.prover_config.zerocheck_save_memory;
-        // Threshold for monomial evaluation path based on proof type:
-        // - App proofs (log_blowup=1): higher threshold (512)
-        // - Recursion proofs: lower threshold (64)
         let monomial_num_y_threshold = if self.config.log_blowup == 1 { 512 } else { 64 };
-        let (gkr_proof, batch_constraint_proof, r) = prove_zerocheck_and_logup_gpu::<HS, TS>(
-            transcript,
-            mpk,
-            ctx,
-            save_memory,
-            monomial_num_y_threshold,
-            self.sm_count,
-        )?;
+        let (gkr_proof, batch_constraint_proof, r) =
+            prove_zerocheck_and_logup_gpu::<
+                <GpuDevice as FieldKernelsFor<HS>>::FK, HS, TS
+            >(
+                transcript,
+                mpk,
+                ctx,
+                save_memory,
+                monomial_num_y_threshold,
+                self.sm_count,
+            )?;
         mem.emit_metrics();
         Ok(((gkr_proof, batch_constraint_proof), r))
     }
@@ -122,12 +149,12 @@ impl<HS: GpuHashScheme, TS: GpuFiatShamirTranscript<HS::SC>>
 impl<HS: GpuHashScheme, TS: GpuFiatShamirTranscript<HS::SC>>
     OpeningProver<GenericGpuBackend<HS>, TS> for GpuDevice
 where
+    GpuDevice: FieldKernelsFor<HS>,
     HS::MerkleHash: MerkleTreeConstructor,
     HS::Digest: MerkleProofQueryDigest,
 {
     type OpeningProof = (StackingProof<HS::SC>, WhirProof<HS::SC>);
-    /// The shared vector `r` where each trace matrix `T, T_{rot}` is opened at `r_{n_T}`.
-    type OpeningPoints = Vec<EF>;
+    type OpeningPoints = Vec<HS::ExtField>;
     type Error = ProverError;
 
     #[instrument(name = "prover.openings", skip_all, fields(phase = "prover"))]
@@ -136,8 +163,8 @@ where
         transcript: &mut TS,
         mpk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
         ctx: ProvingContext<GenericGpuBackend<HS>>,
-        common_main_pcs_data: StackedPcsDataGpu<F, HS::Digest>,
-        r: Vec<EF>,
+        common_main_pcs_data: StackedPcsDataGpu<HS::BaseField, HS::Digest>,
+        r: Vec<HS::ExtField>,
     ) -> Result<Self::OpeningProof, Self::Error> {
         let mut mem = MemTracker::start_and_reset_peak("prover.openings");
         let params = self.config();
@@ -164,7 +191,9 @@ where
             );
         }
         let (stacking_proof, u_prisma, stacked_per_commit) =
-            prove_stacked_opening_reduction_gpu::<HS, TS>(
+            prove_stacked_opening_reduction_gpu::<
+                <GpuDevice as FieldKernelsFor<HS>>::FK, HS, TS
+            >(
                 self,
                 transcript,
                 mpk,
@@ -180,10 +209,18 @@ where
             .chain(u_rest.iter().copied())
             .collect_vec();
 
-        let whir_proof =
-            prove_whir_opening_gpu::<HS, TS>(params, transcript, stacked_per_commit, &u_cube)?;
+        let whir_proof = prove_whir_opening_gpu::<
+            <GpuDevice as FieldKernelsFor<HS>>::FK, HS, TS
+        >(params, transcript, stacked_per_commit, &u_cube)?;
         mem.emit_metrics();
         mem.reset_peak();
         Ok((stacking_proof, whir_proof))
     }
 }
+
+// ── KoalaBear stub impls ───────────────────────────────────────────────────
+// These satisfy the `ProverDevice` bound for `KoalaBearPoseidon2GpuEngine`
+// while the full KB GPU proving kernels (logup/GKR, WHIR, stacked reduction)
+// are being wired to `cuda_kb_all`. They will panic at runtime if called.
+// All KB impls (MultiRapProver, OpeningProver, ProverDevice) are handled by the generic
+// impls using FieldKernelsFor<KoalaBearPoseidon2HashScheme> → KoalaBearKernels

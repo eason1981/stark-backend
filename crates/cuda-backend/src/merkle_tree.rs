@@ -61,6 +61,18 @@ impl BatchQueryMerkle for Digest {
     }
 }
 
+// KoalaBear digest: [KoalaBear; 8]. Raw 4-byte words from the kernel are reinterpreted
+// as KoalaBear values (both are #[repr(transparent)] over u32).
+#[cfg(feature = "koala-bear-poseidon2")]
+impl BatchQueryMerkle for openvm_stark_sdk::config::koala_bear_poseidon2::Digest {
+    fn reconstruct_from_f(out: &[F], base: usize) -> Self {
+        use p3_koala_bear::KoalaBear;
+        std::array::from_fn(|i| unsafe {
+            std::mem::transmute::<F, KoalaBear>(out[base + i])
+        })
+    }
+}
+
 #[cfg(feature = "baby-bear-bn254-poseidon2")]
 impl BatchQueryMerkle for Bn254Digest {
     fn reconstruct_from_f(out: &[F], base: usize) -> Self {
@@ -88,10 +100,10 @@ pub struct MerkleTreeGpu<F, Digest> {
 
 pub trait MerkleTreeConstructor: GpuMerkleHash {
     fn new_merkle_tree(
-        matrix: DeviceMatrix<F>,
+        matrix: DeviceMatrix<Self::BaseField>,  // Generic over BaseField from GpuMerkleHash
         rows_per_query: usize,
         cache_backing_matrix: bool,
-    ) -> Result<MerkleTreeGpu<F, Self::Digest>, MerkleTreeError>;
+    ) -> Result<MerkleTreeGpu<Self::BaseField, Self::Digest>, MerkleTreeError>;
 }
 
 pub trait MerkleProofQueryDigest: BatchQueryMerkle + Copy + Send + Sync + 'static {
@@ -102,6 +114,16 @@ pub trait MerkleProofQueryDigest: BatchQueryMerkle + Copy + Send + Sync + 'stati
 }
 
 impl<F, Digest> MerkleTreeGpu<F, Digest> {
+    /// Construct a MerkleTreeGpu from pre-uploaded digest layers (e.g., from CPU tree).
+    /// The backing_matrix is not cached (None) to conserve GPU memory.
+    pub fn from_digest_layers(
+        digest_layers: Vec<openvm_cuda_common::d_buffer::DeviceBuffer<Digest>>,
+        rows_per_query: usize,
+        root: Digest,
+    ) -> Self {
+        Self { backing_matrix: None, digest_layers, rows_per_query, root }
+    }
+
     pub fn root(&self) -> Digest
     where
         Digest: Clone,
@@ -118,23 +140,25 @@ impl<F, Digest> MerkleTreeGpu<F, Digest> {
     }
 }
 
-// Base field merkle tree — generic constructor
-impl<D: Copy + Send + Sync + 'static> MerkleTreeGpu<F, D> {
+// Generic field Merkle tree constructor - works for any field FieldT
+impl<FieldT: Copy + Send + Sync + 'static, D: Copy + Send + Sync + 'static>
+    MerkleTreeGpu<FieldT, D>
+{
     /// Build a Merkle tree using the given hash scheme `MH`.
     ///
     /// This is the primary constructor; `new()` is a convenience wrapper that
     /// fixes `MH = Poseidon2MerkleHash`.
     #[instrument(name = "merkle_tree", skip_all)]
-    pub fn new_with_hash<MH: MerkleTreeConstructor<Digest = D>>(
-        matrix: DeviceMatrix<F>,
+    pub fn new_with_hash<MH: MerkleTreeConstructor<Digest = D, BaseField = FieldT>>(
+        matrix: DeviceMatrix<FieldT>,
         rows_per_query: usize,
         cache_backing_matrix: bool,
     ) -> Result<Self, MerkleTreeError> {
         MH::new_merkle_tree(matrix, rows_per_query, cache_backing_matrix)
     }
 
-    fn new_generic_with_hash<MH: GpuMerkleHash<Digest = D>>(
-        matrix: DeviceMatrix<F>,
+    pub(crate) fn new_generic_with_hash<MH: GpuMerkleHash<Digest = D, BaseField = FieldT>>(
+        matrix: DeviceMatrix<FieldT>,
         rows_per_query: usize,
         cache_backing_matrix: bool,
     ) -> Result<Self, MerkleTreeError> {
@@ -190,8 +214,8 @@ impl<D: Copy + Send + Sync + 'static> MerkleTreeGpu<F, D> {
         })
     }
 
-    #[instrument(name = "batch_open_rows", skip_all)]
-    pub fn batch_open_rows(
+    #[instrument(name = "batch_open_rows_bb", skip_all)]
+    pub(crate) fn batch_open_rows_bb(
         backing_matrices: &[&DeviceMatrix<F>],
         query_indices: &[usize],
         query_stride: usize,
@@ -281,6 +305,22 @@ impl MerkleTreeConstructor for crate::hash_scheme::Bn254Poseidon2MerkleHash {
     }
 }
 
+// KoalaBear Merkle tree constructor
+#[cfg(feature = "koala-bear-poseidon2")]
+impl MerkleTreeConstructor for crate::hash_scheme::KoalaBearPoseidon2MerkleHash {
+    fn new_merkle_tree(
+        matrix: DeviceMatrix<Self::BaseField>,
+        rows_per_query: usize,
+        cache_backing_matrix: bool,
+    ) -> Result<MerkleTreeGpu<Self::BaseField, Self::Digest>, MerkleTreeError> {
+        MerkleTreeGpu::<Self::BaseField, Self::Digest>::new_generic_with_hash::<Self>(
+            matrix,
+            rows_per_query,
+            cache_backing_matrix,
+        )
+    }
+}
+
 // Base field merkle tree — Poseidon2 default constructor
 impl MerkleTreeGpu<F, Digest> {
     /// Build a Merkle tree using the default Poseidon2 hash.
@@ -296,6 +336,43 @@ impl MerkleTreeGpu<F, Digest> {
 }
 
 // Base field merkle tree — generic batch query (works for any BatchQueryMerkle digest)
+/// Generic (field-agnostic) Merkle query methods.
+///
+/// Both `batch_query_merkle_proofs` and `batch_open_rows` only access digest layers
+/// and the raw bytes of the backing matrix respectively — neither depends on the
+/// field-element type.  We delegate to the concrete-F (`BabyBear`) implementations
+/// via a pointer cast; this is safe because all 32-bit field types (`BabyBear`,
+/// `KoalaBear`) are `#[repr(transparent)]` over `u32` and have identical memory layout.
+impl<FieldT, D: BatchQueryMerkle + Send + Sync + 'static> MerkleTreeGpu<FieldT, D> {
+    pub fn batch_query_merkle_proofs(
+        trees: &[&Self],
+        query_indices: &[usize],
+    ) -> Result<Vec<Vec<Vec<D>>>, MerkleTreeError> {
+        let trees_f: Vec<&MerkleTreeGpu<F, D>> = trees
+            .iter()
+            .map(|t| unsafe { &*((*t) as *const MerkleTreeGpu<FieldT, D> as *const MerkleTreeGpu<F, D>) })
+            .collect();
+        MerkleTreeGpu::<F, D>::batch_query_proofs(&trees_f, query_indices)
+    }
+
+    #[instrument(name = "batch_open_rows_generic", skip_all)]
+    pub fn batch_open_rows(
+        backing_matrices: &[&DeviceMatrix<FieldT>],
+        query_indices: &[usize],
+        query_stride: usize,
+        rows_per_query: usize,
+    ) -> Result<Vec<Vec<Vec<FieldT>>>, MerkleTreeError> {
+        // SAFETY: FieldT and F both are u32-based, same memory layout.
+        let bb_matrices: Vec<&DeviceMatrix<F>> = backing_matrices
+            .iter()
+            .map(|m| unsafe { &*(*m as *const DeviceMatrix<FieldT> as *const DeviceMatrix<F>) })
+            .collect();
+        let result = MerkleTreeGpu::<F, D>::batch_open_rows_bb(&bb_matrices, query_indices, query_stride, rows_per_query)?;
+        // SAFETY: Vec<F> and Vec<FieldT> have same element size and alignment.
+        Ok(unsafe { std::mem::transmute(result) })
+    }
+}
+
 impl<D: BatchQueryMerkle + Send + Sync + 'static> MerkleTreeGpu<F, D> {
     fn batch_query_proofs(
         trees: &[&Self],
@@ -387,28 +464,6 @@ impl<D: BatchQueryMerkle + Send + Sync + 'static> MerkleTreeGpu<F, D> {
         Ok(res)
     }
 
-    /// Batch queries multiple `trees` at _the same_ `query_indices` for merkle proofs.
-    ///
-    /// # Assumptions
-    /// - All `trees` have the same depth.
-    pub fn batch_query_merkle_proofs(
-        trees: &[&Self],
-        query_indices: &[usize],
-    ) -> Result<
-        Vec<
-            // per tree
-            Vec<
-                // per query index
-                Vec<D>, // merkle proof
-            >,
-        >,
-        MerkleTreeError,
-    >
-    where
-        D: MerkleProofQueryDigest,
-    {
-        D::batch_query_merkle_proofs(trees, query_indices)
-    }
 }
 
 impl MerkleProofQueryDigest for Digest {
@@ -430,11 +485,24 @@ impl MerkleProofQueryDigest for Bn254Digest {
     }
 }
 
-// Extension field merkle tree — generic constructor
+// KoalaBear Merkle proof query digest
+#[cfg(feature = "koala-bear-poseidon2")]
+impl MerkleProofQueryDigest for openvm_stark_sdk::config::koala_bear_poseidon2::Digest {
+    fn batch_query_merkle_proofs(
+        trees: &[&MerkleTreeGpu<F, Self>],
+        query_indices: &[usize],
+    ) -> Result<Vec<Vec<Vec<Self>>>, MerkleTreeError> {
+        MerkleTreeGpu::<F, Self>::batch_query_proofs(trees, query_indices)
+    }
+}
+
+// Extension field merkle tree — ext-field-specific constructor (uses compress_rows_ext)
+// Renamed from new_with_hash to new_with_hash_ext to avoid E0034 with the generic impl above.
 impl<D: Copy + Send + Sync + 'static> MerkleTreeGpu<EF, D> {
     /// Build a Merkle tree from an extension-field matrix using hash scheme `MH`.
+    /// Uses `compress_rows_ext` (not `compress_rows`).
     #[instrument(name = "merkle_tree_ext", skip_all)]
-    pub fn new_with_hash<MH: GpuMerkleHash<Digest = D>>(
+    pub fn new_with_hash_ext<MH: GpuMerkleHash<Digest = D, ExtField = EF>>(
         matrix: DeviceMatrix<EF>,
         rows_per_query: usize,
         cache_backing_matrix: bool,
@@ -501,6 +569,6 @@ impl MerkleTreeGpu<EF, Digest> {
         rows_per_query: usize,
         cache_backing_matrix: bool,
     ) -> Result<Self, MerkleTreeError> {
-        Self::new_with_hash::<Poseidon2MerkleHash>(matrix, rows_per_query, cache_backing_matrix)
+        Self::new_with_hash_ext::<Poseidon2MerkleHash>(matrix, rows_per_query, cache_backing_matrix)
     }
 }

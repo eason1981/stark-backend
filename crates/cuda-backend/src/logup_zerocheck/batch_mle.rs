@@ -11,10 +11,13 @@ use openvm_cuda_common::{
 use openvm_stark_backend::prover::{fractional_sumcheck_gkr::Frac, DeviceMultiStarkProvingKey};
 
 use crate::{
-    cuda::logup_zerocheck::{
-        _logup_batch_mle_intermediates_buffer_size, _zerocheck_batch_mle_intermediates_buffer_size,
-        logup_batch_eval_mle, zerocheck_batch_eval_mle, BlockCtx, EvalCoreCtx, LogupCtx,
-        MainMatrixPtrs, ZerocheckCtx,
+    cuda::{
+        field_kernels::FieldKernels,
+        logup_zerocheck::{
+            _logup_batch_mle_intermediates_buffer_size,
+            _zerocheck_batch_mle_intermediates_buffer_size, BlockCtx, EvalCoreCtx, LogupCtx,
+            MainMatrixPtrs, ZerocheckCtx,
+        },
     },
     error::KernelError,
     gpu_backend::GenericGpuBackend,
@@ -33,6 +36,7 @@ const MAX_THREADS_PER_BLOCK: u32 = 128;
 // ============================================================================
 
 /// Computes zerocheck intermediate buffer memory in bytes for a trace.
+// TODO: FK::zerocheck_batch_mle_intermediates_buffer_size — add this method to FieldKernels trait
 fn zerocheck_batch_mle_intermediates_buffer_bytes(
     buffer_size: u32,
     num_x: u32,
@@ -45,6 +49,7 @@ fn zerocheck_batch_mle_intermediates_buffer_bytes(
 }
 
 /// Computes logup intermediate buffer memory in bytes for a trace.
+// TODO: FK::logup_batch_mle_intermediates_buffer_size — add this method to FieldKernels trait
 fn logup_batch_mle_intermediates_buffer_bytes(buffer_size: u32, num_x: u32, num_y: u32) -> usize {
     unsafe {
         _logup_batch_mle_intermediates_buffer_size(buffer_size, num_x, num_y)
@@ -86,7 +91,7 @@ where
 }
 
 /// Context for a single trace used in batch MLE evaluation.
-pub(crate) struct TraceCtx {
+pub(crate) struct TraceCtx<FK: FieldKernels> {
     pub trace_idx: usize,
     pub air_idx: usize,
     #[allow(dead_code)]
@@ -94,14 +99,14 @@ pub(crate) struct TraceCtx {
     pub num_y: u32,
     pub has_constraints: bool,
     pub has_interactions: bool,
-    pub norm_factor: F,
+    pub norm_factor: FK::Val,
     // shared eval pointers (same for zerocheck + logup)
-    pub eq_xi_ptr: *const EF,
-    pub sels_ptr: *const EF,
-    pub prep_ptr: MainMatrixPtrs<EF>,
-    pub main_ptrs_dev: DeviceBuffer<MainMatrixPtrs<EF>>,
-    pub public_ptr: *const F,
-    pub eq_3bs_ptr: *const EF,
+    pub eq_xi_ptr: *const FK::ValExt,
+    pub sels_ptr: *const FK::ValExt,
+    pub prep_ptr: MainMatrixPtrs<FK::ValExt>,
+    pub main_ptrs_dev: DeviceBuffer<MainMatrixPtrs<FK::ValExt>>,
+    pub public_ptr: *const FK::Val,
+    pub eq_3bs_ptr: *const FK::ValExt,
 }
 
 // NOTE[jpw]: we do not expect to use this since most of the time zerocheck will use monomial_par_y.
@@ -110,8 +115,8 @@ pub(crate) struct TraceCtx {
 /// Builder for batched zerocheck MLE evaluation.
 ///
 /// Collects traces and pre-builds all GPU contexts, then evaluates in a single kernel launch.
-pub(crate) struct ZerocheckMleBatchBuilder<'a> {
-    traces: Vec<&'a TraceCtx>,
+pub(crate) struct ZerocheckMleBatchBuilder<'a, FK: FieldKernels> {
+    traces: Vec<&'a TraceCtx<FK>>,
     d_block_ctxs: DeviceBuffer<BlockCtx>,
     d_zc_ctxs: DeviceBuffer<ZerocheckCtx>,
     air_offsets: DeviceBuffer<u32>,
@@ -119,17 +124,17 @@ pub(crate) struct ZerocheckMleBatchBuilder<'a> {
     _intermediates_keepalive: Vec<DeviceBuffer<EF>>,
 }
 
-impl<'a> ZerocheckMleBatchBuilder<'a> {
+impl<'a, FK: FieldKernels> ZerocheckMleBatchBuilder<'a, FK> {
     /// Creates a new builder from an iterator of traces.
     ///
     /// This constructor filters traces with constraints, computes thread configuration,
     /// builds all block and zerocheck contexts, and uploads them to the device.
     pub fn new<HS: GpuHashScheme>(
-        traces: impl Iterator<Item = &'a TraceCtx>,
+        traces: impl Iterator<Item = &'a TraceCtx<FK>>,
         pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
         num_x: u32,
     ) -> Result<Self, MemCopyError> {
-        let traces: Vec<&TraceCtx> = traces.filter(|t| t.has_constraints).collect();
+        let traces: Vec<&TraceCtx<FK>> = traces.filter(|t| t.has_constraints).collect();
 
         if traces.is_empty() {
             return Ok(Self {
@@ -171,6 +176,7 @@ impl<'a> ZerocheckMleBatchBuilder<'a> {
             let buffer_size = air_pk.other_data.zerocheck_mle.inner.buffer_size;
 
             let d_intermediates = if buffer_size > 0 {
+                // TODO: FK::zerocheck_batch_mle_intermediates_buffer_size — add to FieldKernels trait
                 let intermediates_len = unsafe {
                     _zerocheck_batch_mle_intermediates_buffer_size(buffer_size, num_x, t.num_y)
                 };
@@ -182,18 +188,24 @@ impl<'a> ZerocheckMleBatchBuilder<'a> {
                 std::ptr::null_mut()
             };
 
+            // Cast FK::ValExt / FK::Val pointers to EF / F for the BB-typed C structs.
+            // Safety: all field types (BB and KB) are #[repr(transparent)] over u32; their
+            // degree-4 extension fields are [u32; 4]. These casts are pure reinterpretations.
             let eval_ctx = EvalCoreCtx {
-                d_selectors: t.sels_ptr,
-                d_preprocessed: t.prep_ptr,
-                d_main: t.main_ptrs_dev.as_ptr(),
-                d_public: t.public_ptr,
+                d_selectors: t.sels_ptr as *const EF,
+                d_preprocessed: MainMatrixPtrs {
+                    data: t.prep_ptr.data as *const EF,
+                    air_width: t.prep_ptr.air_width,
+                },
+                d_main: t.main_ptrs_dev.as_ptr() as *const MainMatrixPtrs<EF>,
+                d_public: t.public_ptr as *const F,
             };
 
             zc_ctxs_h.push(ZerocheckCtx {
                 eval_ctx,
                 d_intermediates,
                 num_y: t.num_y,
-                d_eq_xi: t.eq_xi_ptr,
+                d_eq_xi: t.eq_xi_ptr as *const EF,
                 d_rules: air_pk.other_data.zerocheck_mle.inner.d_rules.as_raw_ptr(),
                 rules_len: air_pk.other_data.zerocheck_mle.inner.d_rules.len(),
                 d_used_nodes: air_pk.other_data.zerocheck_mle.inner.d_used_nodes.as_ptr(),
@@ -234,30 +246,42 @@ impl<'a> ZerocheckMleBatchBuilder<'a> {
     /// `[air0_x0, air0_x1, ..., air1_x0, air1_x1, ...]`.
     pub fn evaluate(
         &self,
-        lambda_pows: &DeviceBuffer<EF>,
+        lambda_pows: &DeviceBuffer<FK::ValExt>,
         num_x: u32,
-    ) -> Result<DeviceBuffer<EF>, KernelError> {
+    ) -> Result<DeviceBuffer<FK::ValExt>, KernelError> {
         if self.traces.is_empty() {
             return Ok(DeviceBuffer::new());
         }
 
-        evaluate_mle_constraints_gpu_batch(
+        // Cast DeviceBuffer<FK::ValExt> to DeviceBuffer<EF> for the BB-typed batch FFI.
+        // Safety: FK::ValExt and EF are both [u32; 4] representations.
+        let lambda_pows_ef = unsafe {
+            &*(lambda_pows as *const DeviceBuffer<FK::ValExt> as *const DeviceBuffer<EF>)
+        };
+
+        let out_ef = evaluate_mle_constraints_gpu_batch::<FK>(
             &self.d_block_ctxs,
             &self.d_zc_ctxs,
             &self.air_offsets,
-            lambda_pows,
+            lambda_pows_ef,
             lambda_pows.len(),
             num_x,
             self.threads_per_block,
-        )
+        )?;
+
+        // Reinterpret the DeviceBuffer<EF> result as DeviceBuffer<FK::ValExt>.
+        // Safety: same u32-layout guarantee.
+        Ok(unsafe {
+            std::mem::transmute::<DeviceBuffer<EF>, DeviceBuffer<FK::ValExt>>(out_ef)
+        })
     }
 }
 
 /// Builder for batched logup MLE evaluation.
 ///
 /// Collects traces and pre-builds all GPU contexts, then evaluates in a single kernel launch.
-pub(crate) struct LogupMleBatchBuilder<'a> {
-    traces: Vec<&'a TraceCtx>,
+pub(crate) struct LogupMleBatchBuilder<'a, FK: FieldKernels> {
+    traces: Vec<&'a TraceCtx<FK>>,
     d_block_ctxs: DeviceBuffer<BlockCtx>,
     d_logup_ctxs: DeviceBuffer<LogupCtx>,
     air_offsets: DeviceBuffer<u32>,
@@ -265,18 +289,18 @@ pub(crate) struct LogupMleBatchBuilder<'a> {
     _intermediates_keepalive: Vec<DeviceBuffer<EF>>,
 }
 
-impl<'a> LogupMleBatchBuilder<'a> {
+impl<'a, FK: FieldKernels> LogupMleBatchBuilder<'a, FK> {
     /// Creates a new builder from an iterator of traces.
     ///
     /// This constructor filters traces with interactions, computes thread configuration,
     /// builds all block and logup contexts, and uploads them to the device.
     pub fn new<HS: GpuHashScheme>(
-        traces: impl Iterator<Item = &'a TraceCtx>,
+        traces: impl Iterator<Item = &'a TraceCtx<FK>>,
         pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
-        d_challenges_ptr: *const EF,
+        d_challenges_ptr: *const FK::ValExt,
         num_x: u32,
     ) -> Result<Self, MemCopyError> {
-        let traces: Vec<&TraceCtx> = traces.filter(|t| t.has_interactions).collect();
+        let traces: Vec<&TraceCtx<FK>> = traces.filter(|t| t.has_interactions).collect();
 
         if traces.is_empty() {
             return Ok(Self {
@@ -318,6 +342,7 @@ impl<'a> LogupMleBatchBuilder<'a> {
             let buffer_size = air_pk.other_data.interaction_rules.inner.buffer_size;
 
             let d_intermediates = if buffer_size > 0 {
+                // TODO: FK::logup_batch_mle_intermediates_buffer_size — add to FieldKernels trait
                 let intermediates_len = unsafe {
                     _logup_batch_mle_intermediates_buffer_size(buffer_size, num_x, t.num_y)
                 };
@@ -329,20 +354,26 @@ impl<'a> LogupMleBatchBuilder<'a> {
                 std::ptr::null_mut()
             };
 
+            // Cast FK::ValExt / FK::Val pointers to EF / F for the BB-typed C structs.
+            // Safety: all field types are #[repr(transparent)] over u32; degree-4 extensions
+            // are [u32; 4]. These casts are pure memory reinterpretations.
             let eval_ctx = EvalCoreCtx {
-                d_selectors: t.sels_ptr,
-                d_preprocessed: t.prep_ptr,
-                d_main: t.main_ptrs_dev.as_ptr(),
-                d_public: t.public_ptr,
+                d_selectors: t.sels_ptr as *const EF,
+                d_preprocessed: MainMatrixPtrs {
+                    data: t.prep_ptr.data as *const EF,
+                    air_width: t.prep_ptr.air_width,
+                },
+                d_main: t.main_ptrs_dev.as_ptr() as *const MainMatrixPtrs<EF>,
+                d_public: t.public_ptr as *const F,
             };
 
             logup_ctxs_h.push(LogupCtx {
                 eval_ctx,
                 d_intermediates,
                 num_y: t.num_y,
-                d_eq_xi: t.eq_xi_ptr,
-                d_challenges: d_challenges_ptr,
-                d_eq_3bs: t.eq_3bs_ptr,
+                d_eq_xi: t.eq_xi_ptr as *const EF,
+                d_challenges: d_challenges_ptr as *const EF,
+                d_eq_3bs: t.eq_3bs_ptr as *const EF,
                 d_rules: air_pk
                     .other_data
                     .interaction_rules
@@ -384,7 +415,7 @@ impl<'a> LogupMleBatchBuilder<'a> {
     }
 
     /// Returns the trace indices and norm factors in order.
-    pub fn trace_info(&self) -> impl Iterator<Item = (usize, F)> + '_ {
+    pub fn trace_info(&self) -> impl Iterator<Item = (usize, FK::Val)> + '_ {
         self.traces.iter().map(|t| (t.trace_idx, t.norm_factor))
     }
 
@@ -392,18 +423,24 @@ impl<'a> LogupMleBatchBuilder<'a> {
     ///
     /// The buffer contains `num_airs * num_x` elements, laid out as
     /// `[air0_x0, air0_x1, ..., air1_x0, air1_x1, ...]`.
-    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<Frac<EF>>, KernelError> {
+    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<Frac<FK::ValExt>>, KernelError> {
         if self.traces.is_empty() {
             return Ok(DeviceBuffer::new());
         }
 
-        evaluate_mle_interactions_gpu_batch(
+        let out_ef = evaluate_mle_interactions_gpu_batch::<FK>(
             &self.d_block_ctxs,
             &self.d_logup_ctxs,
             &self.air_offsets,
             num_x,
             self.threads_per_block,
-        )
+        )?;
+
+        // Reinterpret DeviceBuffer<Frac<EF>> as DeviceBuffer<Frac<FK::ValExt>>.
+        // Safety: Frac<EF> = (EF, EF) = ([u32;4], [u32;4]) has same layout as Frac<FK::ValExt>.
+        Ok(unsafe {
+            std::mem::transmute::<DeviceBuffer<Frac<EF>>, DeviceBuffer<Frac<FK::ValExt>>>(out_ef)
+        })
     }
 }
 
@@ -411,16 +448,16 @@ impl<'a> LogupMleBatchBuilder<'a> {
 // Memory-aware batched evaluation
 // ============================================================================
 
-pub(crate) fn evaluate_zerocheck_batched<'a, HS: GpuHashScheme>(
-    traces: impl IntoIterator<Item = &'a TraceCtx>,
+pub(crate) fn evaluate_zerocheck_batched<'a, FK: FieldKernels, HS: GpuHashScheme>(
+    traces: impl IntoIterator<Item = &'a TraceCtx<FK>>,
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
-    lambda_pows: &DeviceBuffer<EF>,
+    lambda_pows: &DeviceBuffer<FK::ValExt>,
     num_x: u32,
-    zc_out: &mut [Vec<EF>],
+    zc_out: &mut [Vec<FK::ValExt>],
     memory_limit_bytes: usize,
 ) -> Result<(), KernelError> {
     // Collect traces with constraints and their buffer sizes
-    let mut zc_traces_with_size: Vec<(&TraceCtx, usize)> = traces
+    let mut zc_traces_with_size: Vec<(&TraceCtx<FK>, usize)> = traces
         .into_iter()
         .filter(|t| t.has_constraints)
         .map(|t| {
@@ -449,13 +486,13 @@ pub(crate) fn evaluate_zerocheck_batched<'a, HS: GpuHashScheme>(
             |(_, mem)| *mem,
             memory_limit_bytes,
         );
-        let batch: Vec<&TraceCtx> = zc_traces_with_size[batch_start..batch_start + batch_count]
+        let batch: Vec<&TraceCtx<FK>> = zc_traces_with_size[batch_start..batch_start + batch_count]
             .iter()
             .map(|(t, _)| *t)
             .collect();
 
         if batch.len() == 1 {
-            // Single trace: use non-batch kernel
+            // Single trace: use non-batch kernel (already FK-generic via mle_round)
             let t = batch[0];
             if batch_memory > memory_limit_bytes {
                 tracing::warn!(
@@ -466,7 +503,7 @@ pub(crate) fn evaluate_zerocheck_batched<'a, HS: GpuHashScheme>(
                 );
             }
             let rules = &pk.per_air[t.air_idx].other_data.zerocheck_mle;
-            let out = evaluate_mle_constraints_gpu(
+            let out = evaluate_mle_constraints_gpu::<FK>(
                 t.eq_xi_ptr,
                 t.sels_ptr,
                 t.prep_ptr,
@@ -502,18 +539,18 @@ pub(crate) fn evaluate_zerocheck_batched<'a, HS: GpuHashScheme>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn evaluate_logup_batched<HS: GpuHashScheme>(
-    traces: &[TraceCtx],
+pub(crate) fn evaluate_logup_batched<FK: FieldKernels, HS: GpuHashScheme>(
+    traces: &[TraceCtx<FK>],
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
-    d_challenges_ptr: *const EF,
+    d_challenges_ptr: *const FK::ValExt,
     num_x: u32,
     monomial_num_y_threshold: u32,
-    logup_combinations: &[Option<LogupCombinations>],
-    logup_out: &mut [[Vec<EF>; 2]],
-    logup_tilde_evals: &mut [[EF; 2]],
+    logup_combinations: &[Option<LogupCombinations<FK>>],
+    logup_out: &mut [[Vec<FK::ValExt>; 2]],
+    logup_tilde_evals: &mut [[FK::ValExt; 2]],
     memory_limit_bytes: usize,
 ) -> Result<(), KernelError> {
-    let (low_traces, high_traces): (Vec<&TraceCtx>, Vec<&TraceCtx>) = traces
+    let (low_traces, high_traces): (Vec<&TraceCtx<FK>>, Vec<&TraceCtx<FK>>) = traces
         .iter()
         .filter(|t| t.has_interactions)
         .partition(|t| t.num_y <= monomial_num_y_threshold);
@@ -547,7 +584,7 @@ pub(crate) fn evaluate_logup_batched<HS: GpuHashScheme>(
     }
 
     // Collect high traces with interactions and their buffer sizes
-    let mut logup_traces_with_size: Vec<(&TraceCtx, usize)> = high_traces
+    let mut logup_traces_with_size: Vec<(&TraceCtx<FK>, usize)> = high_traces
         .iter()
         .copied()
         .map(|t| {
@@ -573,10 +610,11 @@ pub(crate) fn evaluate_logup_batched<HS: GpuHashScheme>(
             |(_, mem)| *mem,
             memory_limit_bytes,
         );
-        let batch: Vec<&TraceCtx> = logup_traces_with_size[batch_start..batch_start + batch_count]
-            .iter()
-            .map(|(t, _)| *t)
-            .collect();
+        let batch: Vec<&TraceCtx<FK>> =
+            logup_traces_with_size[batch_start..batch_start + batch_count]
+                .iter()
+                .map(|(t, _)| *t)
+                .collect();
 
         if batch.len() == 1 && batch_memory > memory_limit_bytes {
             // Single oversized trace: use non-batch kernel
@@ -587,7 +625,7 @@ pub(crate) fn evaluate_logup_batched<HS: GpuHashScheme>(
                 memory_limit_bytes,
                 "logup: trace exceeds memory limit, using non-batch kernel"
             );
-            evaluate_single_logup(
+            evaluate_single_logup::<FK, HS>(
                 t,
                 pk,
                 d_challenges_ptr,
@@ -614,8 +652,9 @@ pub(crate) fn evaluate_logup_batched<HS: GpuHashScheme>(
                     logup_tilde_evals[trace_idx][0] = fracs[0].p * norm_factor;
                     logup_tilde_evals[trace_idx][1] = fracs[0].q;
                 } else {
-                    let numer: Vec<EF> = fracs.iter().map(|f| f.p * norm_factor).collect();
-                    let denom: Vec<EF> = fracs.iter().map(|f| f.q).collect();
+                    let numer: Vec<FK::ValExt> =
+                        fracs.iter().map(|f| f.p * norm_factor).collect();
+                    let denom: Vec<FK::ValExt> = fracs.iter().map(|f| f.q).collect();
                     logup_out[trace_idx] = [numer, denom];
                 }
             }
@@ -626,16 +665,16 @@ pub(crate) fn evaluate_logup_batched<HS: GpuHashScheme>(
 }
 
 /// Evaluate logup for a single trace using non-batch kernel.
-fn evaluate_single_logup<HS: GpuHashScheme>(
-    t: &TraceCtx,
+fn evaluate_single_logup<FK: FieldKernels, HS: GpuHashScheme>(
+    t: &TraceCtx<FK>,
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
-    d_challenges_ptr: *const EF,
+    d_challenges_ptr: *const FK::ValExt,
     num_x: u32,
-    logup_out: &mut [Vec<EF>; 2],
-    logup_tilde_eval: &mut [EF; 2],
+    logup_out: &mut [Vec<FK::ValExt>; 2],
+    logup_tilde_eval: &mut [FK::ValExt; 2],
 ) -> Result<(), KernelError> {
     let air_pk = &pk.per_air[t.air_idx];
-    let out = evaluate_mle_interactions_gpu(
+    let out = evaluate_mle_interactions_gpu::<FK>(
         t.eq_xi_ptr,
         t.sels_ptr,
         t.prep_ptr,
@@ -654,8 +693,8 @@ fn evaluate_single_logup<HS: GpuHashScheme>(
         logup_tilde_eval[1] = fracs[0].q;
         // logup_out not set, will be handled directly from tilde eval in compute_batch_s
     } else {
-        let numer: Vec<EF> = fracs.iter().map(|f| f.p * t.norm_factor).collect();
-        let denom: Vec<EF> = fracs.iter().map(|f| f.q).collect();
+        let numer: Vec<FK::ValExt> = fracs.iter().map(|f| f.p * t.norm_factor).collect();
+        let denom: Vec<FK::ValExt> = fracs.iter().map(|f| f.q).collect();
         *logup_out = [numer, denom];
     }
     Ok(())
@@ -666,7 +705,7 @@ fn evaluate_single_logup<HS: GpuHashScheme>(
 // ============================================================================
 
 /// See [`crate::logup_zerocheck`] module docs for async-free/peak memory behavior.
-fn evaluate_mle_constraints_gpu_batch(
+fn evaluate_mle_constraints_gpu_batch<FK: FieldKernels>(
     block_ctxs: &DeviceBuffer<BlockCtx>,
     zc_ctxs: &DeviceBuffer<ZerocheckCtx>,
     air_block_offsets: &DeviceBuffer<u32>,
@@ -688,7 +727,7 @@ fn evaluate_mle_constraints_gpu_batch(
     let mut tmp_sums_buffer = DeviceBuffer::<EF>::with_capacity(num_blocks * num_x as usize);
     let mut output = DeviceBuffer::<EF>::with_capacity(num_airs * num_x as usize);
     unsafe {
-        zerocheck_batch_eval_mle(
+        FK::zerocheck_batch_eval_mle(
             &mut tmp_sums_buffer,
             &mut output,
             block_ctxs,
@@ -706,7 +745,7 @@ fn evaluate_mle_constraints_gpu_batch(
 }
 
 /// See [`crate::logup_zerocheck`] module docs for async-free/peak memory behavior.
-fn evaluate_mle_interactions_gpu_batch(
+fn evaluate_mle_interactions_gpu_batch<FK: FieldKernels>(
     block_ctxs: &DeviceBuffer<BlockCtx>,
     logup_ctxs: &DeviceBuffer<LogupCtx>,
     air_block_offsets: &DeviceBuffer<u32>,
@@ -719,7 +758,7 @@ fn evaluate_mle_interactions_gpu_batch(
     let mut tmp_sums_buffer = DeviceBuffer::<Frac<EF>>::with_capacity(num_blocks * num_x as usize);
     let mut output = DeviceBuffer::<Frac<EF>>::with_capacity(num_airs * num_x as usize);
     unsafe {
-        logup_batch_eval_mle(
+        FK::logup_batch_eval_mle(
             &mut tmp_sums_buffer,
             &mut output,
             block_ctxs,

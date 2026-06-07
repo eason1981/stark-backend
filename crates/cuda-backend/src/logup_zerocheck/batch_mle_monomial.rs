@@ -13,17 +13,20 @@ use p3_field::PrimeCharacteristicRing;
 use tracing::debug;
 
 use crate::{
-    cuda::logup_zerocheck::{
-        logup_monomial_batched, precompute_lambda_combinations,
-        precompute_logup_denom_combinations, precompute_logup_numer_combinations,
-        zerocheck_monomial_batched, zerocheck_monomial_par_y_batched, BlockCtx, EvalCoreCtx,
-        LogupMonomialCommonCtx, LogupMonomialCtx, MonomialAirCtx,
+    cuda::{
+        field_kernels::FieldKernels,
+        logup_zerocheck::{
+            precompute_lambda_combinations,
+            precompute_logup_denom_combinations, precompute_logup_numer_combinations,
+            BlockCtx, EvalCoreCtx,
+            LogupMonomialCommonCtx, LogupMonomialCtx, MainMatrixPtrs, MonomialAirCtx,
+        },
     },
     error::KernelError,
     gpu_backend::GenericGpuBackend,
     hash_scheme::GpuHashScheme,
     logup_zerocheck::batch_mle::TraceCtx,
-    prelude::EF,
+    prelude::{EF, F},
 };
 
 const THREADS_PER_BLOCK: u32 = 256;
@@ -31,8 +34,8 @@ const THREADS_PER_BLOCK: u32 = 256;
 /// Returns true if the trace can use the monomial evaluation path.
 ///
 /// A trace is eligible if it has constraints and the AIR has expanded monomials.
-pub(crate) fn trace_has_monomials<HS: GpuHashScheme>(
-    trace: &TraceCtx,
+pub(crate) fn trace_has_monomials<FK: FieldKernels, HS: GpuHashScheme>(
+    trace: &TraceCtx<FK>,
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
 ) -> bool {
     trace.has_constraints
@@ -45,8 +48,8 @@ pub(crate) fn trace_has_monomials<HS: GpuHashScheme>(
 }
 
 /// Get the number of monomials for a trace. Returns 0 if the trace has no monomials.
-pub(crate) fn get_num_monomials<HS: GpuHashScheme>(
-    trace: &TraceCtx,
+pub(crate) fn get_num_monomials<FK: FieldKernels, HS: GpuHashScheme>(
+    trace: &TraceCtx<FK>,
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
 ) -> u32 {
     pk.per_air[trace.air_idx]
@@ -58,8 +61,8 @@ pub(crate) fn get_num_monomials<HS: GpuHashScheme>(
 }
 
 /// Get the rules_len for a trace's zerocheck DAG.
-pub(crate) fn get_zerocheck_rules_len<HS: GpuHashScheme>(
-    trace: &TraceCtx,
+pub(crate) fn get_zerocheck_rules_len<FK: FieldKernels, HS: GpuHashScheme>(
+    trace: &TraceCtx<FK>,
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
 ) -> usize {
     pk.per_air[trace.air_idx]
@@ -76,19 +79,19 @@ pub(crate) fn get_zerocheck_rules_len<HS: GpuHashScheme>(
 /// `sum_l(coefficient_l * lambda_pows[constraint_idx_l])` for that monomial.
 ///
 /// The AIR must have nonempty monomials.
-pub(crate) fn compute_lambda_combinations<HS: GpuHashScheme>(
+pub(crate) fn compute_lambda_combinations<FK: FieldKernels, HS: GpuHashScheme<BaseField = FK::Val, ExtField = FK::ValExt>>(
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
     air_idx: usize,
-    lambda_pows: &DeviceBuffer<EF>,
-) -> Result<DeviceBuffer<EF>, CudaError> {
+    lambda_pows: &DeviceBuffer<FK::ValExt>,
+) -> Result<DeviceBuffer<FK::ValExt>, CudaError> {
     let monomials = pk.per_air[air_idx]
         .other_data
         .zerocheck_monomials
         .as_ref()
         .expect("AIR must have monomials");
-    let mut buf = DeviceBuffer::<EF>::with_capacity(monomials.num_monomials as usize);
+    let mut buf = DeviceBuffer::<FK::ValExt>::with_capacity(monomials.num_monomials as usize);
     unsafe {
-        precompute_lambda_combinations(
+        FK::precompute_lambda_combinations(
             &mut buf,
             monomials.d_headers.as_ptr(),
             monomials.d_lambda_terms.as_ptr(),
@@ -108,14 +111,14 @@ pub(crate) fn compute_lambda_combinations<HS: GpuHashScheme>(
 ///
 /// The struct holds references to `TraceCtx` which guarantees the underlying
 /// device buffers (including `main_ptrs_dev`) remain valid for the struct's lifetime.
-pub(crate) struct ZerocheckMonomialBatch<'a> {
-    traces: Vec<&'a TraceCtx>,
+pub(crate) struct ZerocheckMonomialBatch<'a, FK: FieldKernels> {
+    traces: Vec<&'a TraceCtx<FK>>,
     block_ctxs: DeviceBuffer<BlockCtx>,
     air_ctxs: DeviceBuffer<MonomialAirCtx>,
     air_offsets: DeviceBuffer<u32>,
 }
 
-impl<'a> ZerocheckMonomialBatch<'a> {
+impl<'a, FK: FieldKernels> ZerocheckMonomialBatch<'a, FK> {
     /// Creates a new batch from an iterator of traces.
     ///
     /// `lambda_combinations` must contain one buffer per trace (in iteration order),
@@ -125,9 +128,9 @@ impl<'a> ZerocheckMonomialBatch<'a> {
     ///
     /// Panics if `traces` is empty or if `lambda_combinations` length doesn't match.
     pub fn new<HS: GpuHashScheme>(
-        traces: impl IntoIterator<Item = &'a TraceCtx>,
+        traces: impl IntoIterator<Item = &'a TraceCtx<FK>>,
         pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
-        lambda_combinations: &[&DeviceBuffer<EF>],
+        lambda_combinations: &[&DeviceBuffer<FK::ValExt>],
     ) -> Result<Self, MemCopyError> {
         let traces: Vec<_> = traces.into_iter().collect();
         assert!(
@@ -168,6 +171,9 @@ impl<'a> ZerocheckMonomialBatch<'a> {
         }
 
         // Build MonomialAirCtx for each trace
+        // Cast FK::ValExt / FK::Val pointers to EF / F for the BB-typed C structs.
+        // Safety: all field types are #[repr(transparent)] over u32; degree-4 extensions
+        // are [u32; 4]. These casts are pure memory reinterpretations.
         let air_ctxs_h: Vec<MonomialAirCtx> = traces
             .iter()
             .zip(lambda_combinations)
@@ -179,19 +185,22 @@ impl<'a> ZerocheckMonomialBatch<'a> {
                     .unwrap();
 
                 let eval_ctx = EvalCoreCtx {
-                    d_selectors: t.sels_ptr,
-                    d_preprocessed: t.prep_ptr,
-                    d_main: t.main_ptrs_dev.as_ptr(),
-                    d_public: t.public_ptr,
+                    d_selectors: t.sels_ptr as *const EF,
+                    d_preprocessed: MainMatrixPtrs {
+                        data: t.prep_ptr.data as *const EF,
+                        air_width: t.prep_ptr.air_width,
+                    },
+                    d_main: t.main_ptrs_dev.as_ptr() as *const MainMatrixPtrs<EF>,
+                    d_public: t.public_ptr as *const F,
                 };
 
                 MonomialAirCtx {
                     d_headers: monomials.d_headers.as_ptr(),
                     d_variables: monomials.d_variables.as_ptr(),
-                    d_lambda_combinations: lc.as_ptr(),
+                    d_lambda_combinations: lc.as_ptr() as *const EF,
                     num_monomials: monomials.num_monomials,
                     eval_ctx,
-                    d_eq_xi: t.eq_xi_ptr,
+                    d_eq_xi: t.eq_xi_ptr as *const EF,
                     num_y: t.num_y,
                 }
             })
@@ -226,7 +235,7 @@ impl<'a> ZerocheckMonomialBatch<'a> {
     /// The buffer contains `num_airs * num_x` elements, laid out as
     /// `[air0_x0, air0_x1, ..., air1_x0, air1_x1, ...]`.
     /// See [`crate::logup_zerocheck`] module docs for async-free/peak memory behavior.
-    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<EF>, KernelError> {
+    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<FK::ValExt>, KernelError> {
         let num_blocks = self.block_ctxs.len();
         let num_airs = self.air_ctxs.len();
 
@@ -249,7 +258,7 @@ impl<'a> ZerocheckMonomialBatch<'a> {
         // valid DeviceBuffers that outlive this call (TraceCtx references, pk monomial data,
         // lambda_combinations). The air_offsets buffer has length num_airs + 1 as required.
         unsafe {
-            zerocheck_monomial_batched(
+            FK::zerocheck_monomial_batched(
                 &mut tmp_sums,
                 &mut output,
                 &self.block_ctxs,
@@ -262,7 +271,11 @@ impl<'a> ZerocheckMonomialBatch<'a> {
             )?;
         }
 
-        Ok(output)
+        // Reinterpret DeviceBuffer<EF> as DeviceBuffer<FK::ValExt>.
+        // Safety: FK::ValExt and EF have identical u32-based memory layout.
+        Ok(unsafe {
+            std::mem::transmute::<DeviceBuffer<EF>, DeviceBuffer<FK::ValExt>>(output)
+        })
     }
 }
 
@@ -278,8 +291,8 @@ const WAVES_TARGET: u32 = 4;
 ///
 /// The caller must filter traces using [`trace_has_monomials`] before constructing.
 /// The batch must contain at least one trace.
-pub(crate) struct ZerocheckMonomialParYBatch<'a> {
-    traces: Vec<&'a TraceCtx>,
+pub(crate) struct ZerocheckMonomialParYBatch<'a, FK: FieldKernels> {
+    traces: Vec<&'a TraceCtx<FK>>,
     block_ctxs: DeviceBuffer<BlockCtx>,
     air_ctxs: DeviceBuffer<MonomialAirCtx>,
     air_offsets: DeviceBuffer<u32>,
@@ -287,7 +300,7 @@ pub(crate) struct ZerocheckMonomialParYBatch<'a> {
     chunk_size: u32,
 }
 
-impl<'a> ZerocheckMonomialParYBatch<'a> {
+impl<'a, FK: FieldKernels> ZerocheckMonomialParYBatch<'a, FK> {
     /// Creates a new batch from an iterator of traces.
     ///
     /// `lambda_combinations` must contain one buffer per trace (in iteration order),
@@ -301,9 +314,9 @@ impl<'a> ZerocheckMonomialParYBatch<'a> {
     /// Panics if `traces` is empty or if `lambda_combinations` length doesn't match.
     #[allow(clippy::too_many_arguments)]
     pub fn new<HS: GpuHashScheme>(
-        traces: impl IntoIterator<Item = &'a TraceCtx>,
+        traces: impl IntoIterator<Item = &'a TraceCtx<FK>>,
         pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
-        lambda_combinations: &[&DeviceBuffer<EF>],
+        lambda_combinations: &[&DeviceBuffer<FK::ValExt>],
         sm_count: u32,
         num_x: u32,
         max_monomials_per_thread: Option<u32>,
@@ -391,6 +404,9 @@ impl<'a> ZerocheckMonomialParYBatch<'a> {
         let num_blocks = block_ctxs_h.len() as u32;
 
         // Build MonomialAirCtx for each trace
+        // Cast FK::ValExt / FK::Val pointers to EF / F for the BB-typed C structs.
+        // Safety: all field types are #[repr(transparent)] over u32; degree-4 extensions
+        // are [u32; 4]. These casts are pure memory reinterpretations.
         let air_ctxs_h: Vec<MonomialAirCtx> = traces
             .iter()
             .zip(lambda_combinations)
@@ -402,19 +418,22 @@ impl<'a> ZerocheckMonomialParYBatch<'a> {
                     .unwrap();
 
                 let eval_ctx = EvalCoreCtx {
-                    d_selectors: t.sels_ptr,
-                    d_preprocessed: t.prep_ptr,
-                    d_main: t.main_ptrs_dev.as_ptr(),
-                    d_public: t.public_ptr,
+                    d_selectors: t.sels_ptr as *const EF,
+                    d_preprocessed: MainMatrixPtrs {
+                        data: t.prep_ptr.data as *const EF,
+                        air_width: t.prep_ptr.air_width,
+                    },
+                    d_main: t.main_ptrs_dev.as_ptr() as *const MainMatrixPtrs<EF>,
+                    d_public: t.public_ptr as *const F,
                 };
 
                 MonomialAirCtx {
                     d_headers: monomials.d_headers.as_ptr(),
                     d_variables: monomials.d_variables.as_ptr(),
-                    d_lambda_combinations: lc.as_ptr(),
+                    d_lambda_combinations: lc.as_ptr() as *const EF,
                     num_monomials: monomials.num_monomials,
                     eval_ctx,
-                    d_eq_xi: t.eq_xi_ptr,
+                    d_eq_xi: t.eq_xi_ptr as *const EF,
                     num_y: t.num_y,
                 }
             })
@@ -450,7 +469,7 @@ impl<'a> ZerocheckMonomialParYBatch<'a> {
     /// The buffer contains `num_airs * num_x` elements, laid out as
     /// `[air0_x0, air0_x1, ..., air1_x0, air1_x1, ...]`.
     /// See [`crate::logup_zerocheck`] module docs for async-free/peak memory behavior.
-    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<EF>, KernelError> {
+    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<FK::ValExt>, KernelError> {
         let num_airs = self.air_ctxs.len();
 
         debug!(
@@ -474,7 +493,7 @@ impl<'a> ZerocheckMonomialParYBatch<'a> {
         // valid DeviceBuffers that outlive this call (TraceCtx references, pk monomial data,
         // lambda_combinations). The air_offsets buffer has length num_airs + 1 as required.
         unsafe {
-            zerocheck_monomial_par_y_batched(
+            FK::zerocheck_monomial_par_y_batched(
                 &mut tmp_sums,
                 &mut output,
                 &self.block_ctxs,
@@ -488,7 +507,11 @@ impl<'a> ZerocheckMonomialParYBatch<'a> {
             )?;
         }
 
-        Ok(output)
+        // Reinterpret DeviceBuffer<EF> as DeviceBuffer<FK::ValExt>.
+        // Safety: FK::ValExt and EF have identical u32-based memory layout.
+        Ok(unsafe {
+            std::mem::transmute::<DeviceBuffer<EF>, DeviceBuffer<FK::ValExt>>(output)
+        })
     }
 }
 
@@ -497,23 +520,23 @@ impl<'a> ZerocheckMonomialParYBatch<'a> {
 // ============================================================================
 
 /// Precomputed logup combinations for a single AIR.
-pub struct LogupCombinations {
-    pub d_numer_combinations: DeviceBuffer<EF>,
-    pub d_denom_combinations: DeviceBuffer<EF>,
-    pub bus_term_sum: EF,
+pub struct LogupCombinations<FK: FieldKernels> {
+    pub d_numer_combinations: DeviceBuffer<FK::ValExt>,
+    pub d_denom_combinations: DeviceBuffer<FK::ValExt>,
+    pub bus_term_sum: FK::ValExt,
 }
 
 /// Precompute logup combinations for a single AIR's interaction monomials.
 ///
 /// The AIR must have nonempty interaction monomials.
-pub(crate) fn compute_logup_combinations<HS: GpuHashScheme>(
+pub(crate) fn compute_logup_combinations<FK: FieldKernels, HS: GpuHashScheme<BaseField = FK::Val, ExtField = FK::ValExt>>(
     pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
     air_idx: usize,
-    d_beta_pows: &DeviceBuffer<EF>,
-    d_eq_3bs: &DeviceBuffer<EF>,
-    eq_3bs_host: &[EF],
-    beta_pows_host: &[EF],
-) -> Result<LogupCombinations, CudaError> {
+    d_beta_pows: &DeviceBuffer<FK::ValExt>,
+    d_eq_3bs: &DeviceBuffer<FK::ValExt>,
+    eq_3bs_host: &[FK::ValExt],
+    beta_pows_host: &[FK::ValExt],
+) -> Result<LogupCombinations<FK>, CudaError> {
     let monomials = pk.per_air[air_idx]
         .other_data
         .interaction_monomials
@@ -521,34 +544,28 @@ pub(crate) fn compute_logup_combinations<HS: GpuHashScheme>(
         .expect("AIR must have interaction monomials");
 
     // Precompute numerator combinations: sum_i(coeff_i * eq_3bs[interaction_idx_i])
-    let mut d_numer_combinations = if monomials.num_numer_monomials > 0 {
-        DeviceBuffer::<EF>::with_capacity(monomials.num_numer_monomials as usize)
-    } else {
-        DeviceBuffer::new()
-    };
-    if monomials.num_numer_monomials > 0 {
+    let d_numer_combinations = if monomials.num_numer_monomials > 0 {
+        let mut buf = DeviceBuffer::<FK::ValExt>::with_capacity(monomials.num_numer_monomials as usize);
         unsafe {
-            precompute_logup_numer_combinations(
-                &mut d_numer_combinations,
+            FK::precompute_logup_numer_combinations(
+                &mut buf,
                 monomials.d_numer_headers.as_ptr(),
                 monomials.d_numer_terms.as_ptr(),
                 d_eq_3bs,
                 monomials.num_numer_monomials,
             )?;
         }
-    }
-
-    // Precompute denominator combinations: sum_i(coeff_i * beta_pows[field_idx_i] *
-    // eq_3bs[interaction_idx_i])
-    let mut d_denom_combinations = if monomials.num_denom_monomials > 0 {
-        DeviceBuffer::<EF>::with_capacity(monomials.num_denom_monomials as usize)
+        buf
     } else {
         DeviceBuffer::new()
     };
-    if monomials.num_denom_monomials > 0 {
+
+    // Precompute denominator combinations
+    let d_denom_combinations = if monomials.num_denom_monomials > 0 {
+        let mut buf = DeviceBuffer::<FK::ValExt>::with_capacity(monomials.num_denom_monomials as usize);
         unsafe {
-            precompute_logup_denom_combinations(
-                &mut d_denom_combinations,
+            FK::precompute_logup_denom_combinations(
+                &mut buf,
                 monomials.d_denom_headers.as_ptr(),
                 monomials.d_denom_terms.as_ptr(),
                 d_beta_pows,
@@ -556,7 +573,10 @@ pub(crate) fn compute_logup_combinations<HS: GpuHashScheme>(
                 monomials.num_denom_monomials,
             )?;
         }
-    }
+        buf
+    } else {
+        DeviceBuffer::new()
+    };
 
     // Compute bus_term_sum on CPU: sum_i(beta_pows[message_len_i] * (bus_idx[i]+1) * eq_3bs[i])
     let interactions = &pk.per_air[air_idx].vk.symbolic_constraints.interactions;
@@ -565,11 +585,11 @@ pub(crate) fn compute_logup_combinations<HS: GpuHashScheme>(
         eq_3bs_host.len(),
         "interaction count must match eq_3bs"
     );
-    let mut bus_term_sum = EF::ZERO;
+    let mut bus_term_sum = FK::ValExt::ZERO;
     for (i, interaction) in interactions.iter().enumerate() {
         let beta_len = beta_pows_host[interaction.message.len()];
         let bus_idx = interaction.bus_index as u32;
-        bus_term_sum += beta_len * EF::from_u32(bus_idx + 1) * eq_3bs_host[i];
+        bus_term_sum += beta_len * FK::ValExt::from_u32(bus_idx + 1) * eq_3bs_host[i];
     }
 
     Ok(LogupCombinations {
@@ -585,8 +605,8 @@ const THREADS_PER_BLOCK_LOGUP: u32 = 128;
 ///
 /// Each block evaluates a monomial chunk for a y_int, producing a FracExt output
 /// compatible with standard reduction.
-pub(crate) struct LogupMonomialBatch<'a> {
-    traces: Vec<&'a TraceCtx>,
+pub(crate) struct LogupMonomialBatch<'a, FK: FieldKernels> {
+    traces: Vec<&'a TraceCtx<FK>>,
     block_ctxs: DeviceBuffer<BlockCtx>,
     common_ctxs: DeviceBuffer<LogupMonomialCommonCtx>,
     numer_ctxs: DeviceBuffer<LogupMonomialCtx>,
@@ -595,7 +615,7 @@ pub(crate) struct LogupMonomialBatch<'a> {
     num_blocks: u32,
 }
 
-impl<'a> LogupMonomialBatch<'a> {
+impl<'a, FK: FieldKernels> LogupMonomialBatch<'a, FK> {
     /// Creates a new batch from an iterator of traces.
     ///
     /// `logup_combinations` must contain one `LogupCombinations` per trace (in iteration order),
@@ -605,9 +625,9 @@ impl<'a> LogupMonomialBatch<'a> {
     ///
     /// Panics if `traces` is empty or if `logup_combinations` length doesn't match.
     pub fn new<HS: GpuHashScheme>(
-        traces: impl IntoIterator<Item = &'a TraceCtx>,
+        traces: impl IntoIterator<Item = &'a TraceCtx<FK>>,
         pk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
-        logup_combinations: &[&LogupCombinations],
+        logup_combinations: &[&LogupCombinations<FK>],
     ) -> Result<Self, MemCopyError> {
         let traces: Vec<_> = traces.into_iter().collect();
         assert!(
@@ -651,7 +671,10 @@ impl<'a> LogupMonomialBatch<'a> {
 
         let num_blocks = block_ctxs_h.len() as u32;
 
-        // Build logup monomial ctxs for each trace
+        // Build logup monomial ctxs for each trace.
+        // Cast FK::ValExt / FK::Val pointers to EF / F for the BB-typed C structs.
+        // Safety: all field types are #[repr(transparent)] over u32; degree-4 extensions
+        // are [u32; 4]. These casts are pure memory reinterpretations.
         let common_ctxs_h: Vec<LogupMonomialCommonCtx> = traces
             .iter()
             .zip(logup_combinations)
@@ -667,16 +690,24 @@ impl<'a> LogupMonomialBatch<'a> {
                 let mono_blocks = max_monomials.div_ceil(threads_per_block).max(1);
 
                 let eval_ctx = EvalCoreCtx {
-                    d_selectors: t.sels_ptr,
-                    d_preprocessed: t.prep_ptr,
-                    d_main: t.main_ptrs_dev.as_ptr(),
-                    d_public: t.public_ptr,
+                    d_selectors: t.sels_ptr as *const EF,
+                    d_preprocessed: MainMatrixPtrs {
+                        data: t.prep_ptr.data as *const EF,
+                        air_width: t.prep_ptr.air_width,
+                    },
+                    d_main: t.main_ptrs_dev.as_ptr() as *const MainMatrixPtrs<EF>,
+                    d_public: t.public_ptr as *const F,
                 };
+
+                // bus_term_sum: transmute FK::ValExt scalar to EF scalar
+                // Safety: both are [u32; 4] in memory.
+                let bus_term_sum_ef: EF =
+                    unsafe { std::mem::transmute_copy(&lc.bus_term_sum) };
 
                 LogupMonomialCommonCtx {
                     eval_ctx,
-                    d_eq_xi: t.eq_xi_ptr,
-                    bus_term_sum: lc.bus_term_sum,
+                    d_eq_xi: t.eq_xi_ptr as *const EF,
+                    bus_term_sum: bus_term_sum_ef,
                     num_y: t.num_y,
                     mono_blocks,
                 }
@@ -694,7 +725,7 @@ impl<'a> LogupMonomialBatch<'a> {
                 LogupMonomialCtx {
                     d_headers: monomials.d_numer_headers.as_ptr(),
                     d_variables: monomials.d_numer_variables.as_ptr(),
-                    d_combinations: lc.d_numer_combinations.as_ptr(),
+                    d_combinations: lc.d_numer_combinations.as_ptr() as *const EF,
                     num_monomials: monomials.num_numer_monomials,
                 }
             })
@@ -711,7 +742,7 @@ impl<'a> LogupMonomialBatch<'a> {
                 LogupMonomialCtx {
                     d_headers: monomials.d_denom_headers.as_ptr(),
                     d_variables: monomials.d_denom_variables.as_ptr(),
-                    d_combinations: lc.d_denom_combinations.as_ptr(),
+                    d_combinations: lc.d_denom_combinations.as_ptr() as *const EF,
                     num_monomials: monomials.num_denom_monomials,
                 }
             })
@@ -750,7 +781,7 @@ impl<'a> LogupMonomialBatch<'a> {
     /// The buffer contains `num_airs * num_x` FracExt elements, laid out as
     /// `[air0_x0, air0_x1, ..., air1_x0, air1_x1, ...]`.
     /// See [`crate::logup_zerocheck`] module docs for async-free/peak memory behavior.
-    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<Frac<EF>>, KernelError> {
+    pub fn evaluate(&self, num_x: u32) -> Result<DeviceBuffer<Frac<FK::ValExt>>, KernelError> {
         let num_airs = self.common_ctxs.len();
 
         debug!(
@@ -773,7 +804,7 @@ impl<'a> LogupMonomialBatch<'a> {
         // SAFETY: All device pointers were constructed from valid DeviceBuffers that outlive this
         // call.
         unsafe {
-            logup_monomial_batched(
+            FK::logup_monomial_batched(
                 &mut tmp_sums,
                 &mut output,
                 &self.block_ctxs,
@@ -788,6 +819,10 @@ impl<'a> LogupMonomialBatch<'a> {
             )?;
         }
 
-        Ok(output)
+        // Reinterpret DeviceBuffer<Frac<EF>> as DeviceBuffer<Frac<FK::ValExt>>.
+        // Safety: Frac<EF> = ([u32;4], [u32;4]) has same layout as Frac<FK::ValExt>.
+        Ok(unsafe {
+            std::mem::transmute::<DeviceBuffer<Frac<EF>>, DeviceBuffer<Frac<FK::ValExt>>>(output)
+        })
     }
 }

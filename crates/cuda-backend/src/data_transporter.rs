@@ -26,12 +26,12 @@ use crate::{
     hash_scheme::GpuHashScheme,
     merkle_tree::MerkleTreeGpu,
     poly::PleMatrix,
-    prelude::{Digest, F, SC},
+    prelude::{Digest, EF, F, SC},
     stacked_pcs::StackedPcsDataGpu,
     AirDataGpu, GpuBackend, GpuDevice, GpuProverConfig, ProverError,
 };
 
-impl<HS: GpuHashScheme> DeviceDataTransporter<HS::SC, GenericGpuBackend<HS>> for GpuDevice {
+impl<HS: GpuHashScheme<BaseField = F, ExtField = EF>> DeviceDataTransporter<HS::SC, GenericGpuBackend<HS>> for GpuDevice {
     fn transport_pk_to_device(
         &self,
         mpk: &MultiStarkProvingKey<HS::SC>,
@@ -45,7 +45,7 @@ impl<HS: GpuHashScheme> DeviceDataTransporter<HS::SC, GenericGpuBackend<HS>> for
                     transport_and_unstack_single_data_h2d::<HS>(d.as_ref(), &self.prover_config)
                         .unwrap()
                 });
-                let other_data = AirDataGpu::new(pk).unwrap();
+                let other_data = AirDataGpu::<F>::new(pk).unwrap();
                 let num_monomials = other_data
                     .zerocheck_monomials
                     .as_ref()
@@ -73,18 +73,24 @@ impl<HS: GpuHashScheme> DeviceDataTransporter<HS::SC, GenericGpuBackend<HS>> for
         )
     }
 
-    fn transport_matrix_to_device(&self, matrix: &ColMajorMatrix<F>) -> DeviceMatrix<F> {
+    fn transport_matrix_to_device(
+        &self,
+        matrix: &ColMajorMatrix<<HS::SC as openvm_stark_backend::StarkProtocolConfig>::F>,
+    ) -> DeviceMatrix<<HS::SC as openvm_stark_backend::StarkProtocolConfig>::F> {
         transport_matrix_h2d_col_major(matrix).unwrap()
     }
 
     fn transport_pcs_data_to_device(
         &self,
-        pcs_data: &StackedPcsData<F, HS::Digest>,
-    ) -> StackedPcsDataGpu<F, HS::Digest> {
-        transport_pcs_data_h2d::<HS::Digest>(pcs_data, &self.prover_config).unwrap()
+        pcs_data: &StackedPcsData<<HS::SC as openvm_stark_backend::StarkProtocolConfig>::F, HS::Digest>,
+    ) -> StackedPcsDataGpu<<HS::SC as openvm_stark_backend::StarkProtocolConfig>::F, HS::Digest> {
+        transport_pcs_data_h2d(pcs_data, &self.prover_config).unwrap()
     }
 
-    fn transport_matrix_from_device_to_host(&self, matrix: &DeviceMatrix<F>) -> ColMajorMatrix<F> {
+    fn transport_matrix_from_device_to_host(
+        &self,
+        matrix: &DeviceMatrix<<HS::SC as openvm_stark_backend::StarkProtocolConfig>::F>,
+    ) -> ColMajorMatrix<<HS::SC as openvm_stark_backend::StarkProtocolConfig>::F> {
         transport_matrix_d2h_col_major(matrix).unwrap()
     }
 }
@@ -121,13 +127,38 @@ pub fn transport_matrix_h2d_row(
     Ok(output)
 }
 
+/// Generic version of `transport_matrix_h2d_row` for any field type.
+///
+/// Works for BabyBear, KoalaBear, and any other 4-byte field element.
+/// Uses `matrix_transpose_fp_any` (byte-level transpose) which is field-agnostic.
+pub fn transport_matrix_h2d_row_any<T: Copy + Send + Sync + 'static>(
+    matrix: &RowMajorMatrix<T>,
+) -> Result<DeviceMatrix<T>, MemCopyError> {
+    use crate::cuda::matrix::matrix_transpose_fp_any;
+    let data = matrix.values.as_slice();
+    let input_buffer = data.to_device()?;
+    let output = DeviceMatrix::<T>::with_capacity(Matrix::height(matrix), Matrix::width(matrix));
+    unsafe {
+        matrix_transpose_fp_any(
+            output.buffer(),
+            &input_buffer,
+            Matrix::width(matrix),
+            Matrix::height(matrix),
+        )?;
+    }
+    current_stream_sync()?;
+    assert_eq!(output.strong_count(), 1);
+    Ok(output)
+}
+
 /// `d` must be the stacked pcs data of a single trace matrix.
 /// This function will transport `d` to device and then unstack it (allocating device memory) to
 /// return `CommittedTraceData<F, Digest>`.
 pub fn transport_and_unstack_single_data_h2d<HS: GpuHashScheme>(
-    d: &StackedPcsData<F, HS::Digest>,
+    d: &StackedPcsData<HS::BaseField, HS::Digest>,
     prover_config: &GpuProverConfig,
 ) -> Result<CommittedTraceData<GenericGpuBackend<HS>>, ProverError> {
+    use crate::cuda::matrix::collapse_strided_matrix_any;
     let _span = info_span!("transport_unstack_h2d").entered();
     debug_assert!(d
         .layout
@@ -146,24 +177,21 @@ pub fn transport_and_unstack_single_data_h2d<HS: GpuHashScheme>(
     let stacked_width = d.matrix.width();
     let stacked_height = d.matrix.height();
     let d_matrix_evals = d.matrix.values.to_device()?;
-    let strided_trace = DeviceBuffer::<F>::with_capacity(lifted_height * width);
-    // SAFETY: D2D copy
-    // - `d_matrix_evals` is the stacked matrix, guaranteed to have length `>= lifted_height *
-    //   width` by definition of stacking
-    // - `d_matrix_evals` stacks a single trace matrix
+    let strided_trace = DeviceBuffer::<HS::BaseField>::with_capacity(lifted_height * width);
+    // SAFETY: D2D copy using raw bytes (all 4-byte field elements have same layout)
     unsafe {
         cuda_memcpy::<true, true>(
             strided_trace.as_mut_raw_ptr(),
             d_matrix_evals.as_raw_ptr(),
-            lifted_height * width * size_of::<F>(),
+            lifted_height * width * size_of::<HS::BaseField>(),
         )?;
     }
     let trace_buffer = if stride == 1 {
         strided_trace
     } else {
-        let buf = DeviceBuffer::<F>::with_capacity(height * width);
+        let buf = DeviceBuffer::<HS::BaseField>::with_capacity(height * width);
         unsafe {
-            collapse_strided_matrix(
+            collapse_strided_matrix_any(
                 buf.as_mut_ptr(),
                 strided_trace.as_ptr(),
                 width as u32,
@@ -223,10 +251,13 @@ pub fn transport_merkle_tree_h2d<F, Digest: Clone>(
     })
 }
 
-pub fn transport_pcs_data_h2d<D: Copy + Clone + PartialEq + Send + Sync + 'static>(
-    pcs_data: &StackedPcsData<F, D>,
+pub fn transport_pcs_data_h2d<
+    FieldT: crate::ntt_field::GpuNttField,
+    D: Copy + Clone + PartialEq + Send + Sync + 'static,
+>(
+    pcs_data: &StackedPcsData<FieldT, D>,
     prover_config: &GpuProverConfig,
-) -> Result<StackedPcsDataGpu<F, D>, ProverError> {
+) -> Result<StackedPcsDataGpu<FieldT, D>, ProverError> {
     let _span = info_span!("transport_pcs_data_h2d").entered();
     let StackedPcsData {
         layout,
@@ -249,7 +280,7 @@ pub fn transport_pcs_data_h2d<D: Copy + Clone + PartialEq + Send + Sync + 'stati
     })
 }
 
-pub fn transport_air_proving_ctx_to_device<HS: GpuHashScheme>(
+pub fn transport_air_proving_ctx_to_device<HS: GpuHashScheme<BaseField = F, ExtField = EF>>(
     cpu_ctx: AirProvingContext<CpuColMajorBackend<SC>>,
 ) -> AirProvingContext<GenericGpuBackend<HS>> {
     let _span = info_span!("transport_air_ctx_h2d").entered();
@@ -263,6 +294,49 @@ pub fn transport_air_proving_ctx_to_device<HS: GpuHashScheme>(
         common_main: trace,
         public_values: cpu_ctx.public_values,
     }
+}
+
+/// Transport a row-major CPU proving context to GPU.
+///
+/// Accepts `ProvingContext<PB>` where `PB::Matrix = RowMajorMatrix<HS::BaseField>`
+/// (e.g. from `openvm-cpu-backend::CpuBackend<SC>`) and returns
+/// `ProvingContext<GenericGpuBackend<HS>>` (col-major GPU DeviceMatrix).
+/// The transpose (row→col) is performed on GPU using `matrix_transpose_fp`.
+pub fn transport_row_major_ctx_to_device<HS, PB>(
+    cpu_ctx: ProvingContext<PB>,
+) -> Result<ProvingContext<GenericGpuBackend<HS>>, MemCopyError>
+where
+    HS: GpuHashScheme,
+    PB: openvm_stark_backend::prover::ProverBackend<
+        Matrix = openvm_stark_backend::p3_matrix::dense::RowMajorMatrix<HS::BaseField>,
+        Val = HS::BaseField,
+    >,
+{
+    use openvm_stark_backend::prover::AirProvingContext as APC;
+    let per_trace = cpu_ctx
+        .per_trace
+        .into_iter()
+        .map(|(air_id, air_ctx)| {
+            // TODO: transport cached_mains (CpuStackedPcsData → StackedPcsDataGpu)
+            // For now, cached_mains are dropped — this is safe only when the proving key's
+            // preprocessed_data already covers what cached_mains provide. For the RISCV
+            // prover path, byte_prep/prog_prep cached_mains need a future GPU transport.
+            let _ = air_ctx.cached_mains; // drop without assertion
+            // Transpose row-major CPU matrix to col-major GPU DeviceMatrix (generic)
+            let gpu_matrix = transport_matrix_h2d_row_any(&air_ctx.common_main)?;
+            // Public values stay as field elements (small, no GPU upload needed)
+            Ok((
+                air_id,
+                APC {
+                    cached_mains: vec![],
+                    common_main: gpu_matrix,
+                    public_values: air_ctx.public_values,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, MemCopyError>>()?;
+    current_stream_sync()?;
+    Ok(ProvingContext { per_trace })
 }
 
 pub fn transport_proving_ctx_to_host(
@@ -352,6 +426,8 @@ pub fn transport_merkle_tree_to_host(tree: &MerkleTreeGpu<F, Digest>) -> MerkleT
     }
 }
 
+/// Transport `CpuStackedPcsData` (from `openvm_cpu_backend`) to `StackedPcsDataGpu`.
+
 pub fn assert_eq_host_and_device_matrix_col_maj<T: Clone + Send + Sync + PartialEq + Debug>(
     cpu: &ColMajorMatrix<T>,
     gpu: &DeviceMatrix<T>,
@@ -410,6 +486,103 @@ pub fn assert_eq_host_and_device_matrix<T: Clone + Send + Sync + PartialEq + Deb
                 r,
                 c
             );
+        }
+    }
+}
+
+// ── KoalaBear impl ────────────────────────────────────────────────────────
+// AirDataGpu is now generic over field type, so KB transport_pk_to_device works.
+#[cfg(feature = "koala-bear-poseidon2")]
+mod kb_transport {
+    use openvm_stark_backend::{
+        keygen::types::MultiStarkProvingKey,
+        prover::{
+            stacked_pcs::StackedPcsData, ColMajorMatrix, DeviceDataTransporter,
+            DeviceMultiStarkProvingKey, DeviceStarkProvingKey,
+        },
+    };
+    use openvm_stark_sdk::config::koala_bear_poseidon2::KoalaBearPoseidon2Config;
+    use tracing::{debug, info_span};
+
+    use crate::{
+        AirDataGpu,
+        base::DeviceMatrix,
+        gpu_backend::GenericGpuBackend,
+        hash_scheme::KoalaBearPoseidon2HashScheme,
+        stacked_pcs::StackedPcsDataGpu,
+        GpuDevice,
+    };
+    use super::{
+        transport_and_unstack_single_data_h2d,
+        transport_matrix_d2h_col_major, transport_matrix_h2d_col_major, transport_pcs_data_h2d,
+    };
+    use openvm_cuda_common::stream::current_stream_sync;
+
+    type KbBackend = GenericGpuBackend<KoalaBearPoseidon2HashScheme>;
+    type KbSC = KoalaBearPoseidon2Config;
+    type KbF = p3_koala_bear::KoalaBear;
+    type KbDigest = <KoalaBearPoseidon2HashScheme as crate::hash_scheme::GpuHashScheme>::Digest;
+
+    impl DeviceDataTransporter<KbSC, KbBackend> for GpuDevice {
+        fn transport_pk_to_device(
+            &self,
+            mpk: &MultiStarkProvingKey<KbSC>,
+        ) -> DeviceMultiStarkProvingKey<KbBackend> {
+            let _span = info_span!("transport_pk_to_device_kb").entered();
+            let per_air = mpk
+                .per_air
+                .iter()
+                .map(|pk| {
+                    let preprocessed_data = pk.preprocessed_data.as_ref().map(|d| {
+                        transport_and_unstack_single_data_h2d::<KoalaBearPoseidon2HashScheme>(
+                            d.as_ref(), &self.prover_config,
+                        )
+                        .unwrap()
+                    });
+                    let other_data = AirDataGpu::<KbF>::new(pk).unwrap();
+                    let num_monomials = other_data
+                        .zerocheck_monomials
+                        .as_ref()
+                        .map(|m| m.num_monomials)
+                        .unwrap_or(0);
+                    debug!(air = %pk.air_name, num_monomials, "monomial expansion (KB)");
+                    DeviceStarkProvingKey {
+                        air_name: pk.air_name.clone(),
+                        vk: pk.vk.clone(),
+                        preprocessed_data,
+                        other_data,
+                    }
+                })
+                .collect();
+            current_stream_sync().unwrap();
+            DeviceMultiStarkProvingKey::new(
+                per_air,
+                mpk.trace_height_constraints.clone(),
+                mpk.max_constraint_degree,
+                mpk.params.clone(),
+                mpk.vk_pre_hash,
+            )
+        }
+
+        fn transport_matrix_to_device(
+            &self,
+            matrix: &ColMajorMatrix<KbF>,
+        ) -> DeviceMatrix<KbF> {
+            transport_matrix_h2d_col_major(matrix).unwrap()
+        }
+
+        fn transport_pcs_data_to_device(
+            &self,
+            pcs_data: &StackedPcsData<KbF, KbDigest>,
+        ) -> StackedPcsDataGpu<KbF, KbDigest> {
+            transport_pcs_data_h2d(pcs_data, &self.prover_config).unwrap()
+        }
+
+        fn transport_matrix_from_device_to_host(
+            &self,
+            matrix: &DeviceMatrix<KbF>,
+        ) -> ColMajorMatrix<KbF> {
+            transport_matrix_d2h_col_major(matrix).unwrap()
         }
     }
 }

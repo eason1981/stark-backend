@@ -16,7 +16,7 @@
 #define __NTT_CUH__
 
 #include <cooperative_groups.h>
-#include "parameters.cuh"
+#include <ntt/parameters.cuh>
 
 template<typename T>
 __device__ __forceinline__

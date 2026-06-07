@@ -49,25 +49,6 @@ impl<F> MatrixDimensions for PleMatrix<F> {
 }
 
 impl PleMatrix<F> {
-    /// Creates a `PleMatrix`. This doubles the VRAM footprint to cache the `mixed` buffer.
-    pub fn from_evals(l_skip: usize, evals: DeviceBuffer<F>, height: usize, width: usize) -> Self {
-        validate_gpu_l_skip(l_skip).expect("GPU PleMatrix requires l_skip <= 10");
-        let mut mixed = evals;
-        if l_skip > 0 {
-            // For univariate coordinate, perform inverse NTT for each 2^l_skip chunk per column:
-            // (width cols) * (height / 2^l_skip chunks per col). Use natural ordering.
-            let num_uni_poly = width * (height >> l_skip);
-            unsafe {
-                batch_ntt_small(&mut mixed, l_skip, num_uni_poly, true).unwrap();
-            }
-        }
-        Self {
-            mixed,
-            height,
-            width,
-        }
-    }
-
     pub fn to_evals(&self, l_skip: usize) -> Result<DeviceMatrix<F>, KernelError> {
         validate_gpu_l_skip(l_skip)?;
         let width = self.width();
@@ -83,6 +64,27 @@ impl PleMatrix<F> {
             }
         }
         Ok(DeviceMatrix::new(Arc::new(evals), height, width))
+    }
+}
+
+/// Generic `PleMatrix::from_evals` for any field implementing `GpuNttField`.
+///
+/// Uses the field-specific `batch_ntt_small` dispatch instead of the BabyBear-only
+/// `crate::cuda::batch_ntt_small::batch_ntt_small`.
+impl<FieldT: crate::ntt_field::GpuNttField> PleMatrix<FieldT> {
+    pub fn from_evals(l_skip: usize, evals: DeviceBuffer<FieldT>, height: usize, width: usize) -> Self {
+        validate_gpu_l_skip(l_skip).expect("GPU PleMatrix requires l_skip <= 10");
+        let mut mixed = evals;
+        if l_skip > 0 {
+            let num_uni_poly = width * (height >> l_skip);
+            FieldT::batch_ntt_small(&mut mixed, l_skip, num_uni_poly, true)
+                .expect("PleMatrix::from_evals: batch_ntt_small failed");
+        }
+        Self {
+            mixed,
+            height,
+            width,
+        }
     }
 }
 
@@ -318,6 +320,33 @@ impl EqEvalSegments<EF> {
     }
 }
 
+impl<ValExt: p3_field::PrimeCharacteristicRing + Copy> EqEvalSegments<ValExt> {
+    /// Creates a new `EqEvalSegments` instance using a generic `FieldKernels` dispatch.
+    ///
+    /// Equivalent to `new` but works for any field, not just BabyBear^4.
+    pub fn new_with_kernels<FK: crate::cuda::field_kernels::FieldKernels<ValExt = ValExt>>(
+        x: &[ValExt],
+    ) -> Result<Self, KernelError> {
+        use openvm_cuda_common::copy::MemCopyH2D;
+        use p3_field::PrimeCharacteristicRing;
+        let max_n = x.len();
+        let mut buffer: DeviceBuffer<ValExt> = DeviceBuffer::with_capacity(2 << max_n);
+        [ValExt::ZERO, ValExt::ONE]
+            .copy_to(&mut buffer)
+            .map_err(KernelError::MemCopy)?;
+        for (i, &x_i) in x.iter().enumerate() {
+            let step = 1 << i;
+            unsafe {
+                let dst = buffer.as_mut_ptr().add(2 * step);
+                let src = buffer.as_ptr().add(step);
+                FK::eq_hypercube_nonoverlapping_stage_ext(dst, src, x_i, step as u32)
+                    .map_err(KernelError::Kernel)?;
+            }
+        }
+        Ok(Self { buffer, max_n })
+    }
+}
+
 /// Same as [EqEvalSegments] but keeping segment tree with buffers separated by layer to allow
 /// dropping layers.
 #[derive(Getters)]
@@ -385,6 +414,62 @@ impl EqEvalLayers<EF> {
     }
 }
 
+impl<ValExt: p3_field::PrimeCharacteristicRing + Copy> EqEvalLayers<ValExt> {
+    /// Generic `new_rev` that works for any field using `FK::eq_hypercube_interleaved_stage_ext`.
+    pub fn new_rev_with_kernels<'a, FK: crate::cuda::field_kernels::FieldKernels<ValExt = ValExt>>(
+        n: usize,
+        x: impl IntoIterator<Item = &'a ValExt>,
+    ) -> Result<Self, KernelError>
+    where
+        ValExt: 'a,
+    {
+        use openvm_cuda_common::copy::MemCopyH2D;
+        use p3_field::PrimeCharacteristicRing;
+        let mut layers = Vec::with_capacity(n + 1);
+        let layer_0 = [ValExt::ONE].to_device().map_err(KernelError::MemCopy)?;
+        layers.push(layer_0);
+        for (i, &x_i) in x.into_iter().enumerate() {
+            let step = 1 << i;
+            let buffer = DeviceBuffer::with_capacity(2 * step);
+            unsafe {
+                let dst = buffer.as_mut_ptr();
+                let src = layers.last().unwrap().as_ptr();
+                FK::eq_hypercube_interleaved_stage_ext(dst, src, x_i, step as u32)
+                    .map_err(KernelError::Kernel)?;
+            }
+            layers.push(buffer);
+        }
+        Ok(Self { layers })
+    }
+
+    /// Generic `new` that works for any field using `FK::eq_hypercube_nonoverlapping_stage_ext`.
+    pub fn new_with_kernels<'a, FK: crate::cuda::field_kernels::FieldKernels<ValExt = ValExt>>(
+        n: usize,
+        x: impl IntoIterator<Item = &'a ValExt>,
+    ) -> Result<Self, KernelError>
+    where
+        ValExt: 'a,
+    {
+        use openvm_cuda_common::copy::MemCopyH2D;
+        use p3_field::PrimeCharacteristicRing;
+        let mut layers = Vec::with_capacity(n + 1);
+        let layer_0 = [ValExt::ONE].to_device().map_err(KernelError::MemCopy)?;
+        layers.push(layer_0);
+        for (i, &x_i) in x.into_iter().enumerate() {
+            let step = 1 << i;
+            let buffer = DeviceBuffer::with_capacity(2 * step);
+            unsafe {
+                let dst = buffer.as_mut_ptr();
+                let src = layers.last().unwrap().as_ptr();
+                FK::eq_hypercube_nonoverlapping_stage_ext(dst, src, x_i, step as u32)
+                    .map_err(KernelError::Kernel)?;
+            }
+            layers.push(buffer);
+        }
+        Ok(Self { layers })
+    }
+}
+
 /// Square-root decomposition of hypercube equality buffer for memory optimization.
 ///
 /// Instead of storing a single buffer of size 2^n, we store two buffers of size
@@ -439,46 +524,45 @@ impl SqrtHyperBuffer {
 ///
 /// Instead of folding columns on GPU, we pre-compute all layers of eq evaluations
 /// and simply drop the highest layer each round (no GPU work needed).
-pub struct SqrtEqLayers {
-    /// Layers for `xi[(n + 1) / 2..]`. Layers insert `xi_i` from the front, so `low` contains the
-    /// latter half of `xi`.
-    pub low: EqEvalLayers<EF>,
-    /// Layers for `xi[..(n + 1) / 2]`.
-    /// Layers: [ eq(xi[j..(n+1)/2], ..) ] for j = (0..(n+1)/2).rev()
-    pub high: EqEvalLayers<EF>,
+///
+/// Type alias: `SqrtEqLayers` = `SqrtEqLayersFor<EF>` so existing BB code works unchanged.
+pub type SqrtEqLayers = SqrtEqLayersFor<EF>;
+
+/// Generic version of `SqrtEqLayers` parametric over the extension field element type.
+/// Used when proving with non-BabyBear fields (e.g. KoalaBear).
+pub struct SqrtEqLayersFor<ValExt> {
+    pub low: EqEvalLayers<ValExt>,
+    pub high: EqEvalLayers<ValExt>,
 }
 
-impl SqrtEqLayers {
-    /// Build layers from `xi` values.
-    ///
-    /// This is meant to match behavior of [SqrtHyperBuffer::from_xi] but with layers.
-    ///
-    /// Example: This means `[a,b,c,d]` should be sent to `low: [[d], [d, c]], high: [[b], [b, a]]`.
+/// BabyBear-specific constructor (uses BB EqEvalLayers::new which calls BB kernels directly).
+impl SqrtEqLayersFor<EF> {
     pub fn from_xi(xi: &[EF]) -> Result<Self, KernelError> {
         let n = xi.len();
         let low_n = n / 2;
         let high_n = n - low_n;
-
         let low = EqEvalLayers::new(low_n, xi[high_n..].iter().rev())?;
         let high = EqEvalLayers::new(high_n, xi[..high_n].iter().rev())?;
+        Ok(Self { low, high })
+    }
+}
 
+impl<ValExt: p3_field::PrimeCharacteristicRing + Copy> SqrtEqLayersFor<ValExt> {
+    pub fn from_xi_with_kernels<FK: crate::cuda::field_kernels::FieldKernels<ValExt = ValExt>>(
+        xi: &[ValExt],
+    ) -> Result<Self, KernelError> {
+        let n = xi.len();
+        let low_n = n / 2;
+        let high_n = n - low_n;
+        let low = EqEvalLayers::new_with_kernels::<FK>(low_n, xi[high_n..].iter().rev())?;
+        let high = EqEvalLayers::new_with_kernels::<FK>(high_n, xi[..high_n].iter().rev())?;
         Ok(Self { low, high })
     }
 
-    pub fn max_n(&self) -> usize {
-        self.low_n() + self.high_n()
-    }
+    pub fn max_n(&self) -> usize { self.low_n() + self.high_n() }
+    pub fn low_n(&self) -> usize { self.low.layers.len() - 1 }
+    pub fn high_n(&self) -> usize { self.high.layers.len() - 1 }
 
-    pub fn low_n(&self) -> usize {
-        self.low.layers.len() - 1
-    }
-
-    pub fn high_n(&self) -> usize {
-        self.high.layers.len() - 1
-    }
-
-    /// Drop the highest layer. Drops from high first, then low. This corresponding to `pop_front`
-    /// from `xi`.
     pub fn drop_layer(&mut self) {
         if self.high.layers.len() > 1 {
             self.high.layers.pop();

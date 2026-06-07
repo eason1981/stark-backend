@@ -11,7 +11,7 @@ use crate::{
 extern "C" {
     fn _whir_algebraic_batch_traces(
         output: *mut F,
-        packets: *const BatchingTracePacket,
+        packets: *const BatchingTracePacket<F>,
         mu_powers: *const EF,
         stacked_height: usize,
         num_packets: usize,
@@ -55,7 +55,7 @@ extern "C" {
 /// - `mu_powers` must be defined for at least the sum of the stacked widths.
 pub unsafe fn whir_algebraic_batch_traces(
     output: &mut DeviceBuffer<F>,
-    packets: &DeviceBuffer<BatchingTracePacket>,
+    packets: &DeviceBuffer<BatchingTracePacket<F>>,
     mu_powers: &DeviceBuffer<EF>,
     skip_domain: u32,
 ) -> Result<(), CudaError> {

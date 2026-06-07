@@ -1,7 +1,7 @@
 use openvm_cuda_common::error::{CudaError, MemCopyError};
 use thiserror::Error;
 
-use crate::{prelude::EF, sponge::GrindError, KernelError};
+use crate::{sponge::GrindError, KernelError};
 
 #[derive(Debug, Error)]
 pub enum Round0PrepError {
@@ -36,7 +36,7 @@ impl From<Round0PrepError> for Round0EvalError {
 #[derive(Debug, Error)]
 pub enum FractionalSumcheckError {
     #[error("nonzero root sum: p={p}, q={q}")]
-    NonzeroRootSum { p: EF, q: EF },
+    NonzeroRootSum { p: String, q: String },
     #[error("bit reversal: {0}")]
     BitReversal(CudaError),
     #[error("segment tree: {0}")]

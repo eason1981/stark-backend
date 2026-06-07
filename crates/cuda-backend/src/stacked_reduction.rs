@@ -1,4 +1,4 @@
-use std::{array::from_fn, cmp::max, ffi::c_void, iter::zip, mem, sync::Arc};
+use std::{array::from_fn, cmp::max, ffi::c_void, iter::zip, mem, marker::PhantomData, sync::Arc};
 
 use itertools::{zip_eq, Itertools};
 use openvm_cuda_common::{
@@ -20,58 +20,52 @@ use openvm_stark_backend::{
     },
 };
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{PrimeCharacteristicRing, TwoAdicField};
+use p3_field::{BasedVectorSpace, ExtensionField, PrimeCharacteristicRing, PrimeField32, TwoAdicField};
 use tracing::{debug, info_span, instrument};
 
 use crate::{
     base::DeviceMatrix,
     cuda::{
         batch_ntt_small::ensure_device_ntt_twiddles_initialized,
-        poly::vector_scalar_multiply_ext,
-        stacked_reduction::{
-            _stacked_reduction_r0_required_temp_buffer_size, initialize_k_rot_from_eq_segments,
-            stacked_reduction_fold_ple, stacked_reduction_sumcheck_mle_round,
-            stacked_reduction_sumcheck_mle_round_degenerate, stacked_reduction_sumcheck_round0,
-            NUM_G,
-        },
-        sumcheck::{fold_mle, triangular_fold_mle},
+        stacked_reduction::NUM_G,
     },
+    cuda::field_kernels::FieldKernels,
     gpu_backend::GenericGpuBackend,
     hash_scheme::GpuHashScheme,
     poly::EqEvalSegments,
-    prelude::{Digest, D_EF, EF, F},
+    prelude::{Digest, F},
     sponge::GpuFiatShamirTranscript,
     stacked_pcs::StackedPcsDataGpu,
-    utils::{compute_barycentric_inv_lagrange_denoms, reduce_raw_u64_to_ef},
+    utils::compute_barycentric_inv_lagrange_denoms,
     GpuDevice, StackedReductionError,
 };
 
 /// Degree of the sumcheck polynomial for stacked reduction.
 pub const STACKED_REDUCTION_S_DEG: usize = 2;
 
-pub struct StackedReductionGpu<D = Digest> {
+pub struct StackedReductionGpu<FK: FieldKernels, D = Digest> {
     sm_count: u32,
 
     l_skip: usize,
     n_stack: usize,
 
-    omega_skip: F,
-    omega_skip_pows: Vec<F>,
-    d_omega_skip_pows: DeviceBuffer<F>,
+    omega_skip: FK::Val,
+    omega_skip_pows: Vec<FK::Val>,
+    d_omega_skip_pows: DeviceBuffer<FK::Val>,
 
-    r_0: EF,
-    d_lambda_pows: DeviceBuffer<EF>,
-    eq_const: EF,
+    r_0: FK::ValExt,
+    d_lambda_pows: DeviceBuffer<FK::ValExt>,
+    eq_const: FK::ValExt,
 
-    pub(crate) stacked_per_commit: Vec<StackedPcsData2<D>>,
+    pub(crate) stacked_per_commit: Vec<StackedPcsData2<FK::Val, D>>,
     d_q_widths: DeviceBuffer<u32>,
     q_width_max: u32,
-    d_q_eval_ptrs: DeviceBuffer<*const EF>,
+    d_q_eval_ptrs: DeviceBuffer<*const FK::ValExt>,
 
     trace_ptrs: Vec<(
-        *const F, /* trace_ptr */
-        usize,    /* height */
-        usize,    /* width */
+        *const FK::Val, /* trace_ptr */
+        usize,          /* height */
+        usize,          /* width */
     )>,
     unstacked_cols: Vec<UnstackedSlice>,
     d_unstacked_cols: DeviceBuffer<UnstackedSlice>,
@@ -83,30 +77,32 @@ pub struct StackedReductionGpu<D = Digest> {
 
     // Initially holds eq(r[1..=n], H_n) for n=0..=n_max but gets updated after each sumcheck round
     // by some custom folding
-    eq_r_ns: EqEvalSegments<EF>,
+    eq_r_ns: EqEvalSegments<FK::ValExt>,
 
     // == After round 0 ==
-    q_evals: Vec<DeviceBuffer<EF>>, // get width from stacked_per_commit
+    q_evals: Vec<DeviceBuffer<FK::ValExt>>, // get width from stacked_per_commit
     // Stores folded eq values that won't change anymore (no more folding)
     // Corresponds to log_height in 0..l_skip+round-1 _before_ round `round`. Gets updated with one
     // new element after each round.
-    eq_stable: Vec<EF>,
-    k_rot_stable: Vec<EF>,
+    eq_stable: Vec<FK::ValExt>,
+    k_rot_stable: Vec<FK::ValExt>,
 
     /// Stores the folded k_rot evaluations for `\kappa_\rot(x, r) = eq_n(rot^{-1}(x), r)` for each
     /// `n` after each round. We use the [EqEvalSegments] type to guard the segment-based
     /// memory layout.
-    k_rot_ns: EqEvalSegments<EF>,
+    k_rot_ns: EqEvalSegments<FK::ValExt>,
     /// Stores eq(u[1+n_T..round-1], b_{T,j}[..round-n_T-1])
-    eq_ub_per_trace: Vec<EF>,
-    d_eq_ub: DeviceBuffer<EF>,
+    eq_ub_per_trace: Vec<FK::ValExt>,
+    d_eq_ub: DeviceBuffer<FK::ValExt>,
 
-    d_block_sums: DeviceBuffer<EF>,
+    d_block_sums: DeviceBuffer<FK::ValExt>,
     d_accum: DeviceBuffer<u64>,
-    d_input_ptrs: DeviceBuffer<*const EF>,
-    d_output_ptrs: DeviceBuffer<*mut EF>,
+    d_input_ptrs: DeviceBuffer<*const FK::ValExt>,
+    d_output_ptrs: DeviceBuffer<*mut FK::ValExt>,
 
     mem: MemTracker,
+
+    _field: PhantomData<FK>,
 }
 
 /// A struct for holding stacked pcs data. We only need the `MerkleTreeGpu` from `StackedPcsDataGpu`
@@ -116,18 +112,18 @@ pub struct StackedReductionGpu<D = Digest> {
 ///
 /// Generic over the Merkle digest type `D`.  The default `D = Digest` preserves the existing
 /// BabyBear-Poseidon2 behaviour.
-pub struct StackedPcsData2<D = Digest> {
-    pub(crate) inner: Arc<StackedPcsDataGpu<F, D>>,
+pub struct StackedPcsData2<Val = F, D = Digest> {
+    pub(crate) inner: Arc<StackedPcsDataGpu<Val, D>>,
     /// The unstacked traces corresponding to `inner`'s commitment.
-    pub(crate) traces: Vec<DeviceMatrix<F>>,
+    pub(crate) traces: Vec<DeviceMatrix<Val>>,
 }
 
-impl<D> StackedPcsData2<D> {
+impl<Val, D> StackedPcsData2<Val, D> {
     /// # Safety
     /// `traces` must be the traces that were committed to in `pcs_data`.
     pub unsafe fn from_raw(
-        pcs_data: Arc<StackedPcsDataGpu<F, D>>,
-        traces: Vec<DeviceMatrix<F>>,
+        pcs_data: Arc<StackedPcsDataGpu<Val, D>>,
+        traces: Vec<DeviceMatrix<Val>>,
     ) -> Self {
         Self {
             inner: pcs_data,
@@ -156,7 +152,7 @@ pub(crate) struct UnstackedSlice {
     stacked_col_idx: u32,
 }
 
-impl<D> StackedReductionGpu<D> {
+impl<FK: FieldKernels, D> StackedReductionGpu<FK, D> {
     fn log_stacked_height(&self, round: usize) -> usize {
         self.n_stack - (round - 1)
     }
@@ -182,24 +178,27 @@ impl<D> StackedReductionGpu<D> {
     skip_all,
     fields(phase = "prover")
 )]
-pub fn prove_stacked_opening_reduction_gpu<HS, TS>(
+pub fn prove_stacked_opening_reduction_gpu<FK, HS, TS>(
     device: &GpuDevice,
     transcript: &mut TS,
     mpk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
     ctx: ProvingContext<GenericGpuBackend<HS>>,
-    common_main_pcs_data: StackedPcsDataGpu<F, HS::Digest>,
-    r: &[EF],
+    common_main_pcs_data: StackedPcsDataGpu<FK::Val, HS::Digest>,
+    r: &[FK::ValExt],
 ) -> Result<
     (
         StackingProof<HS::SC>,
-        Vec<EF>,
-        Vec<StackedPcsData2<HS::Digest>>,
+        Vec<FK::ValExt>,
+        Vec<StackedPcsData2<FK::Val, HS::Digest>>,
     ),
     StackedReductionError,
 >
 where
-    HS: GpuHashScheme,
+    FK: FieldKernels,
+    HS: GpuHashScheme<BaseField = FK::Val, ExtField = FK::ValExt>,
     TS: GpuFiatShamirTranscript<HS::SC>,
+    HS::Digest: Copy + Clone + Send + Sync + 'static,
+    FK::ValExt: ExtensionField<FK::Val> + TwoAdicField,
 {
     let n_stack = device.config.n_stack;
     // Batching randomness
@@ -207,7 +206,7 @@ where
 
     let _round0_span =
         info_span!("prover.openings.stacked_reduction.round0", phase = "prover").entered();
-    let mut prover = StackedReductionGpu::new::<HS>(
+    let mut prover = StackedReductionGpu::<FK, _>::new::<HS>(
         mpk,
         ctx,
         common_main_pcs_data,
@@ -269,14 +268,14 @@ where
     Ok((proof, u_vec, prover.stacked_per_commit))
 }
 
-impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
+impl<FK: FieldKernels, D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<FK, D> {
     #[instrument("stacked_reduction_new", level = "debug", skip_all)]
-    fn new<HS: GpuHashScheme<Digest = D>>(
+    fn new<HS: GpuHashScheme<BaseField = FK::Val, ExtField = FK::ValExt, Digest = D>>(
         mpk: &DeviceMultiStarkProvingKey<GenericGpuBackend<HS>>,
         ctx: ProvingContext<GenericGpuBackend<HS>>,
-        common_main_pcs_data: StackedPcsDataGpu<F, D>,
-        r: &[EF],
-        lambda: EF,
+        common_main_pcs_data: StackedPcsDataGpu<FK::Val, D>,
+        r: &[FK::ValExt],
+        lambda: FK::ValExt,
         sm_count: u32,
     ) -> Result<Self, StackedReductionError> {
         ensure_device_ntt_twiddles_initialized().map_err(StackedReductionError::InitNttTwiddles)?;
@@ -284,7 +283,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         let l_skip = mpk.params.l_skip;
         let n_stack = mpk.params.n_stack;
 
-        let omega_skip = F::two_adic_generator(l_skip);
+        let omega_skip = FK::Val::two_adic_generator(l_skip);
         let omega_skip_pows = omega_skip.powers().take(1 << l_skip).collect_vec();
         let d_omega_skip_pows = omega_skip_pows.to_device()?;
 
@@ -349,7 +348,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         let mut unstacked_cols = Vec::with_capacity(total_num_cols);
         let mut need_rot_per_col = Vec::with_capacity(total_num_cols);
         let mut ht_diff_idxs = Vec::new();
-        let mut trace_ptrs = Vec::new();
+        let mut trace_ptrs: Vec<(*const FK::Val, usize, usize)> = Vec::new();
         for (commit_idx, stacked) in stacked_per_commit.iter().enumerate() {
             let layout = stacked.layout();
             let need_rot_for_commit = &need_rot_per_commit[commit_idx];
@@ -379,7 +378,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         ht_diff_idxs.push(unstacked_cols.len());
 
         let lambda_pows_used = lambda.powers().take(total_num_cols * 2).collect_vec();
-        let mut lambda_pows = vec![EF::ZERO; total_num_cols * 2];
+        let mut lambda_pows = vec![FK::ValExt::ZERO; total_num_cols * 2];
         for (col_idx, need_rot) in need_rot_per_col.into_iter().enumerate() {
             let lambda_eq_idx = 2 * col_idx;
             let lambda_rot_idx = 2 * col_idx + 1;
@@ -409,10 +408,10 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
                 .saturating_sub(l_skip)
         );
         let eq_r_ns =
-            EqEvalSegments::new(&r[1..]).map_err(StackedReductionError::EqEvalSegments)?;
+            EqEvalSegments::new_with_kernels::<FK>(&r[1..]).map_err(StackedReductionError::EqEvalSegments)?;
 
         let eq_const = eval_eq_uni_at_one(l_skip, r[0] * omega_skip);
-        let eq_ub_per_trace = vec![EF::ONE; unstacked_cols.len()];
+        let eq_ub_per_trace = vec![FK::ValExt::ONE; unstacked_cols.len()];
         let d_q_eval_ptrs = if stacked_per_commit.is_empty() {
             DeviceBuffer::new()
         } else {
@@ -428,7 +427,8 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         } else {
             DeviceBuffer::with_capacity(stacked_per_commit.len())
         };
-        let d_accum = DeviceBuffer::<u64>::with_capacity(STACKED_REDUCTION_S_DEG * D_EF);
+        // Degree-4 extension: 4 u64 accumulators per sumcheck eval point
+        let d_accum = DeviceBuffer::<u64>::with_capacity(STACKED_REDUCTION_S_DEG * 4);
         let d_eq_ub = if max_window_len > 0 {
             DeviceBuffer::with_capacity(max_window_len)
         } else {
@@ -467,6 +467,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
             d_input_ptrs,
             d_output_ptrs,
             mem,
+            _field: PhantomData,
         })
     }
 
@@ -483,20 +484,23 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
     )]
     fn batch_sumcheck_uni_round0_poly(
         &mut self,
-    ) -> Result<UnivariatePoly<EF>, StackedReductionError> {
+    ) -> Result<UnivariatePoly<FK::ValExt>, StackedReductionError>
+    where
+        FK::ValExt: ExtensionField<FK::Val> + TwoAdicField,
+    {
         let l_skip = self.l_skip;
         let skip_domain = 1 << l_skip;
         let s_0_deg = sumcheck_round0_deg(l_skip, STACKED_REDUCTION_S_DEG);
 
         // Accumulation buffers for G0, G1, G2 (on identity coset)
         // d_g_pos: for n >= 0 traces
-        let mut d_g_pos = DeviceBuffer::<EF>::with_capacity(NUM_G * skip_domain);
+        let mut d_g_pos = DeviceBuffer::<FK::ValExt>::with_capacity(NUM_G * skip_domain);
         d_g_pos
             .fill_zero()
             .map_err(StackedReductionError::FillZero)?;
 
         // d_g_neg[k]: for traces with |n| = k+1, where n < 0 and k in 0..l_skip
-        let mut d_g_neg: Vec<DeviceBuffer<EF>> = (0..l_skip)
+        let mut d_g_neg: Vec<DeviceBuffer<FK::ValExt>> = (0..l_skip)
             .map(|_| {
                 let b = DeviceBuffer::with_capacity(NUM_G * skip_domain);
                 b.fill_zero().map_err(StackedReductionError::FillZero)?;
@@ -522,7 +526,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
 
             // Allocate block_sums buffer for intermediate reduction
             let block_sums_len = unsafe {
-                _stacked_reduction_r0_required_temp_buffer_size(
+                FK::stacked_r0_temp_buf_size(
                     trace_height as u32,
                     trace_width as u32,
                     l_skip as u32,
@@ -530,14 +534,14 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
             } as usize;
 
             if block_sums_len > self.d_block_sums.len() {
-                self.d_block_sums = DeviceBuffer::<EF>::with_capacity(block_sums_len);
+                self.d_block_sums = DeviceBuffer::<FK::ValExt>::with_capacity(block_sums_len);
             }
 
             unsafe {
                 // 2 per column for (eq, k_rot) - coeff_eq and coeff_rot
                 let lambda_pows_ptr = self.d_lambda_pows.as_ptr().add(2 * window[0]);
 
-                stacked_reduction_sumcheck_round0(
+                FK::stacked_sumcheck_round0(
                     &self.eq_r_ns,
                     trace_ptr,
                     lambda_pows_ptr,
@@ -568,25 +572,28 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
     /// For n < 0: multiply each E by ind(Z) = eval_in_uni(l_skip, n, Z)
     fn reconstruct_s0_from_g(
         &self,
-        d_g_pos: DeviceBuffer<EF>,
-        d_g_neg: Vec<DeviceBuffer<EF>>,
+        d_g_pos: DeviceBuffer<FK::ValExt>,
+        d_g_neg: Vec<DeviceBuffer<FK::ValExt>>,
         s_0_deg: usize,
-    ) -> Result<UnivariatePoly<EF>, StackedReductionError> {
+    ) -> Result<UnivariatePoly<FK::ValExt>, StackedReductionError>
+    where
+        FK::ValExt: ExtensionField<FK::Val> + TwoAdicField,
+    {
         let l_skip = self.l_skip;
         let skip_domain = 1 << l_skip;
         let large_uni_domain = (s_0_deg + 1).next_power_of_two(); // 2 * skip_domain
         let dft = Radix2BowersSerial;
 
         // Accumulate s_0 coefficients across all buckets
-        let mut s_0_coeffs = vec![EF::ZERO; large_uni_domain];
+        let mut s_0_coeffs = vec![FK::ValExt::ZERO; large_uni_domain];
 
         // --- Process n >= 0 bucket ---
         let g_pos = d_g_pos.to_host()?;
-        if !g_pos.iter().all(|&x| x == EF::ZERO) {
+        if !g_pos.iter().all(|&x| x == FK::ValExt::ZERO) {
             // Build E polynomials for n >= 0
-            let e0 = eq_uni_poly::<F, EF>(l_skip, self.r_0);
-            let e1 = eq_uni_poly::<F, EF>(l_skip, self.r_0 * self.omega_skip);
-            let e2 = eq_uni_at_one_poly(l_skip, self.eq_const);
+            let e0 = eq_uni_poly::<FK::Val, FK::ValExt>(l_skip, self.r_0);
+            let e1 = eq_uni_poly::<FK::Val, FK::ValExt>(l_skip, self.r_0 * self.omega_skip);
+            let e2 = eq_uni_at_one_poly::<FK::Val, FK::ValExt>(l_skip, self.eq_const);
 
             // NTT-based multiplication: s_0 += E0*G0 + E1*G1 + E2*G2
             Self::ntt_multiply_and_add(
@@ -606,7 +613,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         for (bucket_idx, d_g_neg_bucket) in d_g_neg.into_iter().enumerate() {
             let n_abs = bucket_idx + 1;
             let g_neg = d_g_neg_bucket.to_host()?;
-            if g_neg.iter().all(|&x| x == EF::ZERO) {
+            if g_neg.iter().all(|&x| x == FK::ValExt::ZERO) {
                 continue;
             }
 
@@ -616,10 +623,10 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
             let r_uni = self.r_0.exp_power_of_2(n_abs);
 
             // Build E polynomials with indicator factor
-            let ind = build_indicator_poly(l_skip, -(n_abs as isize));
-            let e0_base = eq_uni_poly::<F, EF>(l, r_uni);
-            let e1_base = eq_uni_poly::<F, EF>(l, r_uni * omega_l);
-            let e2_base = eq_uni_at_one_poly(l, self.eq_const);
+            let ind = build_indicator_poly::<FK::Val, FK::ValExt>(l_skip, -(n_abs as isize));
+            let e0_base = eq_uni_poly::<FK::Val, FK::ValExt>(l, r_uni);
+            let e1_base = eq_uni_poly::<FK::Val, FK::ValExt>(l, r_uni * omega_l);
+            let e2_base = eq_uni_at_one_poly::<FK::Val, FK::ValExt>(l, self.eq_const);
 
             // E_neg = E_base * ind (polynomial multiplication)
             let e0_neg = poly_multiply_ntt(&dft, e0_base.coeffs(), ind.coeffs(), skip_domain);
@@ -648,16 +655,16 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
     fn ntt_multiply_and_add(
         dft: &Radix2BowersSerial,
         domain_size: usize,
-        e_coeffs: [&[EF]; 3],
-        g_evals: [&[EF]; 3], // G evaluations on identity coset
-        out: &mut [EF],
-    ) {
+        e_coeffs: [&[FK::ValExt]; 3],
+        g_evals: [&[FK::ValExt]; 3], // G evaluations on identity coset
+        out: &mut [FK::ValExt],
+    ) where FK::ValExt: TwoAdicField {
         // 1. iDFT G evaluations to get G coefficients
-        let g_coeffs: [Vec<EF>; 3] = std::array::from_fn(|i| dft.idft(g_evals[i].to_vec()));
+        let g_coeffs: [Vec<FK::ValExt>; 3] = std::array::from_fn(|i| dft.idft(g_evals[i].to_vec()));
 
         // 2. Prepare coefficient matrices, resize to domain_size
-        let mut e_padded = vec![EF::ZERO; domain_size * 3];
-        let mut g_padded = vec![EF::ZERO; domain_size * 3];
+        let mut e_padded = vec![FK::ValExt::ZERO; domain_size * 3];
+        let mut g_padded = vec![FK::ValExt::ZERO; domain_size * 3];
         for i in 0..3 {
             for (j, &c) in e_coeffs[i].iter().enumerate() {
                 e_padded[j * 3 + i] = c;
@@ -672,7 +679,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         let g_evals_mat = dft.dft_batch(RowMajorMatrix::new(g_padded, 3));
 
         // 4. Pointwise multiply and sum: s[j] = sum_i e[j][i] * g[j][i]
-        let mut s_evals = vec![EF::ZERO; domain_size];
+        let mut s_evals = vec![FK::ValExt::ZERO; domain_size];
         for (j, s_j) in s_evals.iter_mut().enumerate() {
             for i in 0..3 {
                 *s_j += e_evals_mat.values[j * 3 + i] * g_evals_mat.values[j * 3 + i];
@@ -689,7 +696,10 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
     }
 
     #[instrument("stacked_reduction_fold_ple", level = "debug", skip_all)]
-    fn fold_ple_evals(&mut self, u_0: EF) -> Result<(), StackedReductionError> {
+    fn fold_ple_evals(&mut self, u_0: FK::ValExt) -> Result<(), StackedReductionError>
+    where
+        FK::ValExt: ExtensionField<FK::Val>,
+    {
         let l_skip = self.l_skip;
         let n_stack = self.n_stack;
         let r_0 = self.r_0;
@@ -708,7 +718,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
             let num_x = 1 << n_stack;
             let stacked_width = layout.width();
             debug_assert_eq!(layout.height(), 1 << (l_skip + n_stack));
-            let folded_evals = DeviceBuffer::<EF>::with_capacity(num_x * stacked_width);
+            let folded_evals = DeviceBuffer::<FK::ValExt>::with_capacity(num_x * stacked_width);
             // We must fill with zeros because some parts will be left empty due to stacking
             folded_evals
                 .fill_zero()
@@ -730,7 +740,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
                 // - `d_omega_skip_pows` and `d_inv_lagrange_denoms` have length `>= skip_domain`
                 unsafe {
                     let dst = folded_evals.as_mut_ptr().add(dst_offset);
-                    stacked_reduction_fold_ple(
+                    FK::stacked_fold_ple(
                         trace.buffer().as_ptr(),
                         dst,
                         &self.d_omega_skip_pows,
@@ -753,11 +763,11 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         let eq_uni_u01 = eval_eq_uni_at_one(l_skip, u_0);
         debug_assert_eq!(self.eq_r_ns.buffer.len(), 2 << n_max);
         self.k_rot_ns.buffer = DeviceBuffer::with_capacity(2 << n_max);
-        [EF::ZERO].copy_to(&mut self.k_rot_ns.buffer)?;
+        [FK::ValExt::ZERO].copy_to(&mut self.k_rot_ns.buffer)?;
         unsafe {
             // SAFETY:
             // - We allocated `k_rot_ns` with same capacity as `eq_r_ns` above.
-            initialize_k_rot_from_eq_segments(
+            FK::init_k_rot_from_eq_segments(
                 &self.eq_r_ns,
                 &mut self.k_rot_ns.buffer,
                 eq_uni_u0r0_rot,
@@ -766,7 +776,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
             )
             .map_err(StackedReductionError::InitKRot)?;
         }
-        vector_scalar_multiply_ext(&mut self.eq_r_ns.buffer, eq_uni_u0r0)
+        FK::vector_scalar_multiply_ext(&mut self.eq_r_ns.buffer, eq_uni_u0r0)
             .map_err(StackedReductionError::VectorScalarMul)?;
 
         // Compute the special eq values for n = -l_skip..0
@@ -794,8 +804,11 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
     fn batch_sumcheck_poly_eval(
         &mut self,
         round: usize,
-        _u_prev: EF,
-    ) -> Result<[EF; STACKED_REDUCTION_S_DEG], StackedReductionError> {
+        _u_prev: FK::ValExt,
+    ) -> Result<[FK::ValExt; STACKED_REDUCTION_S_DEG], StackedReductionError>
+    where
+        FK::ValExt: ExtensionField<FK::Val>,
+    {
         let l_skip = self.l_skip;
 
         let q_eval_ptrs = self.q_evals.iter().map(|q| q.as_ptr()).collect_vec();
@@ -803,27 +816,27 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
 
         if self.n_max >= (round - 1) {
             // Move stable eq, k_rot to stable vectors
-            let mut tmp = [EF::ZERO];
+            let mut tmp = [FK::ValExt::ZERO];
             debug_assert_eq!(self.eq_stable.len(), l_skip + round - 1);
             debug_assert_eq!(self.k_rot_stable.len(), l_skip + round - 1);
             debug_assert!(self.eq_r_ns.buffer.len() > 1);
             debug_assert!(self.k_rot_ns.buffer.len() > 1);
             // SAFETY: size of eq_r_ns, k_rot_ns is currently 2 * 2^{n_max - round + 1}
             unsafe {
-                // D2H copy of single EF element
+                // D2H copy of single FK::ValExt element
                 cuda_memcpy::<true, false>(
                     tmp.as_mut_ptr() as *mut c_void,
                     self.eq_r_ns.get_ptr(0) as *const c_void,
-                    size_of::<EF>(),
+                    size_of::<FK::ValExt>(),
                 )?;
 
                 self.eq_stable.push(tmp[0]);
 
-                // D2H copy of single EF element
+                // D2H copy of single FK::ValExt element
                 cuda_memcpy::<true, false>(
                     tmp.as_mut_ptr() as *mut c_void,
                     self.k_rot_ns.get_ptr(0) as *const c_void,
-                    size_of::<EF>(),
+                    size_of::<FK::ValExt>(),
                 )?;
 
                 self.k_rot_stable.push(tmp[0]);
@@ -861,7 +874,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
                 eq_ub_slice.copy_to(&mut self.d_eq_ub)?;
                 let stacked_height = self.stacked_height(round);
                 unsafe {
-                    stacked_reduction_sumcheck_mle_round_degenerate(
+                    FK::stacked_sumcheck_mle_round_degenerate(
                         &self.d_q_eval_ptrs,
                         &self.d_eq_ub,
                         eq_r,
@@ -884,7 +897,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
 
                 let stacked_height = self.stacked_height(round);
                 unsafe {
-                    stacked_reduction_sumcheck_mle_round(
+                    FK::stacked_sumcheck_mle_round(
                         &self.d_q_eval_ptrs,
                         &self.eq_r_ns,
                         &self.k_rot_ns,
@@ -902,17 +915,20 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
 
             // D2H copy and reduce modulo P
             let h_accum = self.d_accum.to_host()?;
-            let evals = reduce_raw_u64_to_ef(&h_accum);
+            let evals = reduce_raw_u64_to_valext::<FK::Val, FK::ValExt>(&h_accum);
             s_evals_batch.push(evals);
         }
 
         Ok(from_fn(|i| {
-            s_evals_batch.iter().map(|evals| evals[i]).sum::<EF>()
+            s_evals_batch.iter().map(|evals| evals[i]).sum::<FK::ValExt>()
         }))
     }
 
     #[instrument("stacked_reduction_fold_mle", level = "debug", skip_all, fields(round = round))]
-    fn fold_mle_evals(&mut self, round: usize, u_round: EF) -> Result<(), StackedReductionError> {
+    fn fold_mle_evals(&mut self, round: usize, u_round: FK::ValExt) -> Result<(), StackedReductionError>
+    where
+        FK::ValExt: ExtensionField<FK::Val>,
+    {
         debug_assert!(round <= self.n_stack);
         let l_skip = self.l_skip;
         let (folded_q_evals, input_ptrs, output_ptrs): (Vec<_>, Vec<_>, Vec<_>) = self
@@ -934,7 +950,7 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
         //   and heights `stacked_height(round + 1)`.
         let output_height = self.stacked_height(round + 1) as u32;
         unsafe {
-            fold_mle(
+            FK::fold_mle(
                 &self.d_input_ptrs,
                 &self.d_output_ptrs,
                 &self.d_q_widths,
@@ -952,29 +968,29 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
             let output_max_n = input_max_n.saturating_sub(1);
             let output_len = 1 << input_max_n;
 
-            let mut buffer = DeviceBuffer::<EF>::with_capacity(output_len);
-            [EF::ZERO].copy_to(&mut buffer)?;
+            let mut buffer = DeviceBuffer::<FK::ValExt>::with_capacity(output_len);
+            [FK::ValExt::ZERO].copy_to(&mut buffer)?;
             // SAFETY:
             // - eq_r_ns has max_n equal to input_max_n
             // - we allocate output for half the size of eq_r_ns
             unsafe {
                 let mut output = EqEvalSegments::from_raw_parts(buffer, output_max_n);
                 if input_max_n != 0 {
-                    triangular_fold_mle(&mut output, &self.eq_r_ns, u_round, output_max_n)
+                    FK::triangular_fold_mle(&mut output, &self.eq_r_ns, u_round, output_max_n)
                         .map_err(StackedReductionError::TriangularFoldMle)?;
                 }
                 self.eq_r_ns = output;
             }
 
-            let mut buffer = DeviceBuffer::<EF>::with_capacity(output_len);
-            [EF::ZERO].copy_to(&mut buffer)?;
+            let mut buffer = DeviceBuffer::<FK::ValExt>::with_capacity(output_len);
+            [FK::ValExt::ZERO].copy_to(&mut buffer)?;
             // SAFETY:
             // - k_rot_ns has max_n equal to input_max_n
             // - we allocate output for half the size of eq_r_ns
             unsafe {
                 let mut output = EqEvalSegments::from_raw_parts(buffer, output_max_n);
                 if input_max_n != 0 {
-                    triangular_fold_mle(&mut output, &self.k_rot_ns, u_round, output_max_n)
+                    FK::triangular_fold_mle(&mut output, &self.k_rot_ns, u_round, output_max_n)
                         .map_err(StackedReductionError::TriangularFoldMle)?;
                 }
                 self.k_rot_ns = output;
@@ -989,14 +1005,14 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
                 // b_{T,j}[..=round-n_T-1]) value
                 debug_assert_eq!(s.stacked_row_idx % (1 << s.log_height), 0);
                 let b = (s.stacked_row_idx >> (l_skip + round - 1)) & 1;
-                *eq_ub *= eval_eq_mle(&[u_round], &[F::from_bool(b == 1)]);
+                *eq_ub *= eval_eq_mle(&[u_round], &[FK::Val::from_bool(b == 1)]);
             }
         }
         Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn get_stacked_openings(&self) -> Result<Vec<Vec<EF>>, StackedReductionError> {
+    fn get_stacked_openings(&self) -> Result<Vec<Vec<FK::ValExt>>, StackedReductionError> {
         self.q_evals
             .iter()
             .map(|q| q.to_host().map_err(StackedReductionError::MemCopy))
@@ -1004,12 +1020,43 @@ impl<D: Copy + Clone + Send + Sync + 'static> StackedReductionGpu<D> {
     }
 }
 
+/// Reduce overflowing u64 accumulators to extension field elements.
+///
+/// After reducing modulo `p`, the u64 values are in Montgomery form for the base field `FVal`.
+/// The extension field `FExt` is assumed to be a degree-4 extension of `FVal`.
+#[inline]
+fn reduce_raw_u64_to_valext<FVal, FExt>(accum: &[u64]) -> Vec<FExt>
+where
+    FVal: PrimeField32,
+    FExt: BasedVectorSpace<FVal>,
+{
+    // Degree-4 extension: 4 base-field components per extension element
+    const D: usize = 4;
+    debug_assert_eq!(accum.len() % D, 0);
+    debug_assert_eq!(size_of::<FVal>(), size_of::<u32>());
+    accum
+        .chunks_exact(D)
+        .map(|chunk| {
+            FExt::from_basis_coefficients_fn(|i| {
+                let monty_raw = (chunk[i] % FVal::ORDER_U64) as u32;
+                // SAFETY: FVal: PrimeField32 is repr(transparent) over u32;
+                // ptr::read bypasses compile-time size check (identical to transmute).
+                unsafe { std::ptr::read(&monty_raw as *const u32 as *const FVal) }
+            })
+        })
+        .collect()
+}
+
 /// Build indicator polynomial: ind(Z) = sum_{k=0}^{2^{n_abs}-1} Z^{k * 2^l} / 2^{n_abs}
-fn build_indicator_poly(l_skip: usize, n: isize) -> UnivariatePoly<EF> {
+fn build_indicator_poly<FVal, FExt>(l_skip: usize, n: isize) -> UnivariatePoly<FExt>
+where
+    FVal: PrimeCharacteristicRing + Copy,
+    FExt: PrimeCharacteristicRing + From<FVal> + Copy,
+{
     let n_abs = (-n) as usize;
     let l = l_skip - n_abs;
-    let scale = EF::ONE.halve().exp_u64(n_abs as u64);
-    let mut coeffs = vec![EF::ZERO; 1 << l_skip];
+    let scale = FExt::ONE.halve().exp_u64(n_abs as u64);
+    let mut coeffs = vec![FExt::ZERO; 1 << l_skip];
     for k in 0..(1 << n_abs) {
         coeffs[k * (1 << l)] = scale;
     }
@@ -1019,21 +1066,30 @@ fn build_indicator_poly(l_skip: usize, n: isize) -> UnivariatePoly<EF> {
 /// eq_uni_at_one polynomial: eq_D(Z, 1) as a polynomial in Z
 ///
 /// All coefficients are n_inv * scale where n_inv = 1 / 2^l
-fn eq_uni_at_one_poly(l: usize, scale: EF) -> UnivariatePoly<EF> {
-    let n_inv = F::ONE.halve().exp_u64(l as u64);
-    UnivariatePoly::new(vec![EF::from(n_inv) * scale; 1 << l])
+fn eq_uni_at_one_poly<FVal, FExt>(l: usize, scale: FExt) -> UnivariatePoly<FExt>
+where
+    FVal: PrimeCharacteristicRing + Copy,
+    FExt: PrimeCharacteristicRing + From<FVal> + Copy,
+{
+    let n_inv = FVal::ONE.halve().exp_u64(l as u64);
+    UnivariatePoly::new(vec![FExt::from(n_inv) * scale; 1 << l])
 }
 
 /// NTT-based polynomial multiplication
-fn poly_multiply_ntt(dft: &Radix2BowersSerial, a: &[EF], b: &[EF], min_size: usize) -> Vec<EF> {
+fn poly_multiply_ntt<FExt: PrimeCharacteristicRing + TwoAdicField + Copy>(
+    dft: &Radix2BowersSerial,
+    a: &[FExt],
+    b: &[FExt],
+    min_size: usize,
+) -> Vec<FExt> {
     let size = (a.len() + b.len() - 1).max(min_size).next_power_of_two();
     let mut a_pad = a.to_vec();
-    a_pad.resize(size, EF::ZERO);
+    a_pad.resize(size, FExt::ZERO);
     let mut b_pad = b.to_vec();
-    b_pad.resize(size, EF::ZERO);
+    b_pad.resize(size, FExt::ZERO);
     let a_evals = dft.dft(a_pad);
     let b_evals = dft.dft(b_pad);
-    let c_evals: Vec<EF> = a_evals
+    let c_evals: Vec<FExt> = a_evals
         .into_iter()
         .zip(b_evals)
         .map(|(a, b)| a * b)

@@ -10,7 +10,7 @@ use openvm_stark_backend::{
     keygen::types::StarkProvingKey,
     StarkProtocolConfig,
 };
-use p3_field::PrimeCharacteristicRing;
+use p3_field::{Field, PrimeCharacteristicRing, PrimeField32};
 
 use crate::{
     logup_zerocheck::rules::{codec::Codec, SymbolicRulesGpu},
@@ -18,17 +18,16 @@ use crate::{
         ExpandedInteractionMonomials, ExpandedMonomials, InteractionMonomialTerm, LambdaTerm,
         MonomialHeader, PackedVar,
     },
-    prelude::F,
 };
 
-pub struct AirDataGpu {
+pub struct AirDataGpu<Fv: Field + PrimeField32 = crate::prelude::F> {
     pub interaction_rules: InteractionEvalRules,
     /// Whether to buffer vars depends on the performance and memory access patterns of the kernel.
     /// This may be tuned.
     pub zerocheck_round0: ConstraintOnlyRules<true>,
     pub zerocheck_mle: ConstraintOnlyRules<false>,
-    pub zerocheck_monomials: Option<ZerocheckMonomials>,
-    pub interaction_monomials: Option<InteractionMonomials>,
+    pub zerocheck_monomials: Option<ZerocheckMonomials<Fv>>,
+    pub interaction_monomials: Option<InteractionMonomials<Fv>>,
 }
 
 /// Used for GKR input evaluation and logup MLE sumcheck rounds.
@@ -54,21 +53,21 @@ pub struct EvalRules {
     pub buffer_size: u32,
 }
 
-pub struct ZerocheckMonomials {
+pub struct ZerocheckMonomials<Fv: Field + PrimeField32 = crate::prelude::F> {
     pub d_headers: DeviceBuffer<MonomialHeader>,
     pub d_variables: DeviceBuffer<PackedVar>,
-    pub d_lambda_terms: DeviceBuffer<LambdaTerm<F>>,
+    pub d_lambda_terms: DeviceBuffer<LambdaTerm<Fv>>,
     pub num_monomials: u32,
 }
 
-pub struct InteractionMonomials {
+pub struct InteractionMonomials<Fv: Field + PrimeField32 = crate::prelude::F> {
     pub d_numer_headers: DeviceBuffer<MonomialHeader>,
     pub d_numer_variables: DeviceBuffer<PackedVar>,
-    pub d_numer_terms: DeviceBuffer<InteractionMonomialTerm<F>>,
+    pub d_numer_terms: DeviceBuffer<InteractionMonomialTerm<Fv>>,
     pub num_numer_monomials: u32,
     pub d_denom_headers: DeviceBuffer<MonomialHeader>,
     pub d_denom_variables: DeviceBuffer<PackedVar>,
-    pub d_denom_terms: DeviceBuffer<InteractionMonomialTerm<F>>,
+    pub d_denom_terms: DeviceBuffer<InteractionMonomialTerm<Fv>>,
     pub num_denom_monomials: u32,
     pub max_fields_len: usize,
     pub num_interactions: u32,
@@ -82,8 +81,8 @@ fn to_device_or_empty<T>(data: &[T]) -> Result<DeviceBuffer<T>, MemCopyError> {
     }
 }
 
-impl AirDataGpu {
-    pub fn new<S: StarkProtocolConfig<F = F>>(
+impl<Fv: Field + PrimeField32> AirDataGpu<Fv> {
+    pub fn new<S: StarkProtocolConfig<F = Fv>>(
         pk: &StarkProvingKey<S>,
     ) -> Result<Self, MemCopyError> {
         let dag = &pk.vk.symbolic_constraints;
@@ -115,9 +114,8 @@ impl AirDataGpu {
     }
 }
 
-impl ZerocheckMonomials {
-    pub fn from_expanded(expanded: &ExpandedMonomials<F>) -> Result<Self, MemCopyError> {
-        // Validate bounds for all monomial headers to prevent out-of-bounds access in CUDA kernel
+impl<Fv: Field + PrimeField32> ZerocheckMonomials<Fv> {
+    pub fn from_expanded(expanded: &ExpandedMonomials<Fv>) -> Result<Self, MemCopyError> {
         let num_variables = expanded.variables.len();
         let num_lambda_terms = expanded.lambda_terms.len();
         for (i, hdr) in expanded.headers.iter().enumerate() {
@@ -146,9 +144,8 @@ impl ZerocheckMonomials {
     }
 }
 
-impl InteractionMonomials {
-    pub fn from_expanded(expanded: &ExpandedInteractionMonomials<F>) -> Result<Self, MemCopyError> {
-        // Validate numerator monomial headers
+impl<Fv: Field + PrimeField32> InteractionMonomials<Fv> {
+    pub fn from_expanded(expanded: &ExpandedInteractionMonomials<Fv>) -> Result<Self, MemCopyError> {
         let num_numer_vars = expanded.numer_variables.len();
         let num_numer_terms = expanded.numer_terms.len();
         for (i, hdr) in expanded.numer_headers.iter().enumerate() {
@@ -164,7 +161,6 @@ impl InteractionMonomials {
             );
         }
 
-        // Validate denominator monomial headers
         let num_denom_vars = expanded.denom_variables.len();
         let num_denom_terms = expanded.denom_terms.len();
         for (i, hdr) in expanded.denom_headers.iter().enumerate() {
@@ -196,13 +192,12 @@ impl InteractionMonomials {
 }
 
 impl InteractionEvalRules {
-    pub fn new(symbolic_constraints: &SymbolicConstraints<F>) -> Result<Self, MemCopyError> {
+    pub fn new<F: Field + PrimeField32>(symbolic_constraints: &SymbolicConstraints<F>) -> Result<Self, MemCopyError> {
         let interactions = &symbolic_constraints.interactions;
         let num_interactions = interactions.len();
         if num_interactions == 0 {
             return Ok(Self {
                 inner: EvalRules::dummy(),
-
                 max_fields_len: 0,
                 d_pair_idxs: DeviceBuffer::new(),
             });
@@ -212,7 +207,6 @@ impl InteractionEvalRules {
             .map(|interaction| interaction.message.len())
             .max()
             .unwrap_or(0);
-        // [alpha, beta^0, ..., beta^max_fields_len]
         let symbolic_challenges: Vec<SymbolicExpression<F>> = (0..max_fields_len + 2)
             .map(|index| SymbolicVariable::<F>::new(Entry::Challenge, index).into())
             .collect();
@@ -230,7 +224,6 @@ impl InteractionEvalRules {
             frac_pairs.push(numer);
             frac_pairs.push(denom);
         }
-        // build DAG without sorting constraint idxs:
         let (dag, pair_idxs) = {
             let mut dag_builder = SymbolicDagBuilder::new();
             let mut dag_pair_idxs: Vec<(usize, u32)> = frac_pairs
@@ -243,7 +236,6 @@ impl InteractionEvalRules {
                 .collect_vec();
             dag_pair_idxs.sort();
             let (constraint_idx, pair_idxs): (Vec<_>, Vec<_>) = dag_pair_idxs.into_iter().unzip();
-            // NOTE: do not sort pair_idxs since we need to keep them in pairs
             let dag = SymbolicExpressionDag {
                 nodes: dag_builder.nodes,
                 constraint_idx,
@@ -251,7 +243,6 @@ impl InteractionEvalRules {
             (dag, pair_idxs)
         };
         let rules = SymbolicRulesGpu::new(&dag, false);
-        // Build used_nodes with duplicates, preserving order from constraint_idx
         let used_nodes = dag
             .constraint_idx
             .iter()
@@ -270,30 +261,20 @@ impl InteractionEvalRules {
         let inner = EvalRules {
             d_rules,
             d_used_nodes,
-            buffer_size: rules
-                .buffer_size
-                .try_into()
-                .expect("buffer_size exceeds u32"),
+            buffer_size: rules.buffer_size.try_into().expect("buffer_size exceeds u32"),
         };
 
-        Ok(Self {
-            inner,
-            d_pair_idxs,
-            max_fields_len,
-        })
+        Ok(Self { inner, d_pair_idxs, max_fields_len })
     }
 }
 
 impl<const BUFFER_VARS: bool> ConstraintOnlyRules<BUFFER_VARS> {
-    pub fn new(dag: &SymbolicExpressionDag<F>) -> Result<Self, MemCopyError> {
+    pub fn new<F: Field + PrimeField32>(dag: &SymbolicExpressionDag<F>) -> Result<Self, MemCopyError> {
         if dag.num_constraints() == 0 {
-            return Ok(Self {
-                inner: EvalRules::dummy(),
-            });
+            return Ok(Self { inner: EvalRules::dummy() });
         }
 
         let rules = SymbolicRulesGpu::new(dag, BUFFER_VARS);
-        // Build used_nodes with duplicates, preserving order from constraint_idx
         let used_nodes = dag
             .constraint_idx
             .iter()
@@ -307,10 +288,7 @@ impl<const BUFFER_VARS: bool> ConstraintOnlyRules<BUFFER_VARS> {
         let inner = EvalRules {
             d_rules,
             d_used_nodes,
-            buffer_size: rules
-                .buffer_size
-                .try_into()
-                .expect("buffer_size exceeds u32"),
+            buffer_size: rules.buffer_size.try_into().expect("buffer_size exceeds u32"),
         };
         Ok(Self { inner })
     }

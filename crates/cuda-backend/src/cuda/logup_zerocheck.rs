@@ -652,6 +652,17 @@ pub unsafe fn fold_ef_frac_columns(
     ))
 }
 
+/// Raw-pointer variant of [`fold_ef_frac_columns`] for use when `dst` is a raw device pointer.
+pub unsafe fn fold_ef_frac_columns_raw(
+    src: &DeviceBuffer<Frac<EF>>,
+    dst: *mut Frac<EF>,
+    size: usize,
+    r: EF,
+) -> Result<(), CudaError> {
+    debug_assert!(src.len() >= size);
+    CudaError::from_result(_frac_fold_fpext_columns(src.as_ptr(), dst, size, r))
+}
+
 /// In-place fold. See [`fold_ef_frac_columns`] for details.
 pub unsafe fn fold_ef_frac_columns_inplace(
     buffer: &mut DeviceBuffer<Frac<EF>>,
@@ -724,6 +735,34 @@ pub unsafe fn frac_compute_round_and_fold(
         r_prev,
         out_device.as_mut_ptr(),
         tmp_block_sums.as_mut_ptr(),
+    ))
+}
+
+/// Raw-pointer variant of [`frac_compute_round_and_fold`] — `dst_pq` is a raw device pointer.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn frac_compute_round_and_fold_raw(
+    eq_xi_low: *const EF,
+    eq_xi_high: *const EF,
+    src_pq: *const Frac<EF>,
+    dst_pq: *mut Frac<EF>,
+    src_pq_size: usize,
+    eq_low_cap: usize,
+    lambda: EF,
+    r_prev: EF,
+    out: *mut EF,
+    tmp: *mut EF,
+) -> Result<(), CudaError> {
+    CudaError::from_result(_frac_compute_round_and_fold(
+        eq_xi_low,
+        eq_xi_high,
+        src_pq,
+        dst_pq,
+        src_pq_size,
+        eq_low_cap,
+        lambda,
+        r_prev,
+        out,
+        tmp,
     ))
 }
 

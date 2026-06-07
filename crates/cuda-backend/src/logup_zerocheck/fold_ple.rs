@@ -6,31 +6,30 @@ use openvm_stark_backend::prover::MatrixDimensions;
 use super::errors::FoldPleError;
 use crate::{
     base::DeviceMatrix,
-    cuda::{batch_ntt_small::validate_gpu_l_skip, logup_zerocheck::fold_ple_from_evals},
-    prelude::{EF, F},
+    cuda::{batch_ntt_small::validate_gpu_l_skip, field_kernels::FieldKernels},
 };
 
 /// Folds plain using mixed coefficients, folds rotation from evals.
 /// - `mixed` should be mixed coefficient form of the _lifted_ trace.
 /// - `trace_evals` should be unlifted (the original trace).
-pub fn fold_ple_evals_rotate(
+pub fn fold_ple_evals_rotate<FK: FieldKernels>(
     l_skip: usize,
-    d_omega_skip_pows: &DeviceBuffer<F>,
-    trace_evals: &DeviceMatrix<F>,
-    d_inv_lagrange_denoms_r0: &DeviceBuffer<EF>,
+    d_omega_skip_pows: &DeviceBuffer<FK::Val>,
+    trace_evals: &DeviceMatrix<FK::Val>,
+    d_inv_lagrange_denoms_r0: &DeviceBuffer<FK::ValExt>,
     need_rot: bool,
-) -> Result<DeviceMatrix<EF>, FoldPleError> {
+) -> Result<DeviceMatrix<FK::ValExt>, FoldPleError> {
     validate_gpu_l_skip(l_skip)?;
     let width = trace_evals.width();
     let height = trace_evals.height();
     let num_x = max(height >> l_skip, 1);
     let out_width = width * if need_rot { 2 } else { 1 };
-    let folded_buf = DeviceBuffer::<EF>::with_capacity(num_x * out_width);
+    let folded_buf = DeviceBuffer::<FK::ValExt>::with_capacity(num_x * out_width);
     // SAFETY:
     // - We allocated `folded_buf` for `num_x * width * (1 or 2)` elements.
     // - `trace_evals` is `height x width` unlighted matrix
     unsafe {
-        fold_ple_evals_gpu(
+        fold_ple_evals_gpu::<FK>(
             l_skip,
             d_omega_skip_pows,
             trace_evals,
@@ -41,7 +40,7 @@ pub fn fold_ple_evals_rotate(
 
         if need_rot {
             // Fold the rotation from evals
-            fold_ple_evals_gpu(
+            fold_ple_evals_gpu::<FK>(
                 l_skip,
                 d_omega_skip_pows,
                 trace_evals,
@@ -65,12 +64,12 @@ pub fn fold_ple_evals_rotate(
 /// - `mat` should be the unlifted original matrix of trace evaluations.
 /// - `output` should be a valid pointer to a buffer of size at least `num_x * width` where `num_x =
 ///   max(height / 2^l_skip, 1)`.
-pub unsafe fn fold_ple_evals_gpu(
+pub unsafe fn fold_ple_evals_gpu<FK: FieldKernels>(
     l_skip: usize,
-    d_omega_skip_pows: &DeviceBuffer<F>,
-    mat: &DeviceMatrix<F>,
-    output: *mut EF,
-    d_inv_lagrange_denoms_r0: &DeviceBuffer<EF>,
+    d_omega_skip_pows: &DeviceBuffer<FK::Val>,
+    mat: &DeviceMatrix<FK::Val>,
+    output: *mut FK::ValExt,
+    d_inv_lagrange_denoms_r0: &DeviceBuffer<FK::ValExt>,
     rotate: bool,
 ) -> Result<(), FoldPleError> {
     validate_gpu_l_skip(l_skip)?;
@@ -87,8 +86,9 @@ pub unsafe fn fold_ple_evals_gpu(
     let num_x = lifted_height / skip_domain;
 
     // Launch kernel
+    // TODO: FK::fold_ple_from_evals — add this method to FieldKernels trait
     unsafe {
-        fold_ple_from_evals(
+        FK::fold_ple_from_evals(
             mat.buffer(),
             output,
             d_omega_skip_pows,

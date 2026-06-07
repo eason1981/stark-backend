@@ -12,7 +12,7 @@
  */
 
 #include "launcher.cuh"
-#include "ntt/parameters.cuh"
+#include <ntt/parameters.cuh>
 
 __constant__ fr_t FORWARD_TWIDDLES[TWIDDLES_SIZE];
 __constant__ fr_t INVERSE_TWIDDLES[TWIDDLES_SIZE];

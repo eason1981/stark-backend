@@ -22,6 +22,7 @@ serde.workspace = true
 # Plonky3
 p3-field = { workspace = true }
 p3-baby-bear = { workspace = true }
+p3-koala-bear = { workspace = true, optional = true }
 p3-bn254 = { workspace = true, optional = true }
 p3-dft = { workspace = true }
 p3-util = { workspace = true }
@@ -47,6 +48,11 @@ baby-bear-bn254-poseidon2 = [
     "openvm-stark-sdk/baby-bear-bn254-poseidon2",
     "dep:p3-bn254",
     "dep:zkhash",
+]
+# KoalaBear Poseidon2 GPU support: compiles KB sponge + merkle CUDA kernels
+# and enables the KoalaBearPoseidon2GpuEngine type.
+koala-bear-poseidon2 = [
+    "dep:p3-koala-bear",
 ]
 touchemall = ["openvm-cuda-common/touchemall"]
 test-utils = ["openvm-stark-backend/test-utils"]
